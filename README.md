@@ -26,7 +26,7 @@ This command will generate a Verilog file named `sys_reg.v` from the `sys_reg.xl
 - `argparse`
 
 ## Author
-- Engineer: zcao
+- Engineer: czz
 - Date: 2025-03-18
 - Version: 1.0
 
