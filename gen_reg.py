@@ -64,6 +64,7 @@ def parse_excel_var(sheet):
     return result
 
 def calculate_bit_width(bit_str):
+    bit_str = str(bit_str)  # fix: ensure bit_str is a string
     parts = bit_str.split(':')
     if len(parts) == 1:
         _ = int(parts[0])  # Check if it is a valid integer
