@@ -388,7 +388,10 @@ def generate_verilog(module_info, registers, filename):
             code.append(f"    for(j = 0; j <= {reg.var_val}; j = j + 1) begin:rdata_loop_{reg.reg_name}")
             code.append(f"        if (reg_addr[{_addr_width-1}:0] == {_addr_width}'h{reg.offset} + {_addr_width}'h{reg.var_step} * j) begin")
             for field in reg.fields:
-                code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size -1}:0];")
+                if field.bits_size == 1:
+                    code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j];")
+                else:
+                    code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size -1}:0];")
             code.append("        end")
             code.append("    end")
             code.append("end\n")    
