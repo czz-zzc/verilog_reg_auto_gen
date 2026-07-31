@@ -1,4 +1,4 @@
-﻿#########################################################################################
+#########################################################################################
 # Engineer:         czz
 # Date:             2025-10-28
 # Version:          2.0
@@ -17,7 +17,7 @@ B_HEADERS = [
     'offset', 'repeat', 'reg_name', 'bits', 'field',
     'sw_access', 'hw_access', 'default', 'attribute', 'description',
 ]
-SUPPORTED_ACCESS = {'RW', 'RO', 'W1P', 'W1C', 'RC', 'RAM_RW', 'RAM_RO'}
+SUPPORTED_ACCESS = {'RW', 'WO', 'RO', 'W1P', 'W1C', 'RC', 'RAM_RW', 'RAM_RO'}
 
 
 def normalize_header(value):

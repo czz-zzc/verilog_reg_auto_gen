@@ -11,6 +11,7 @@ python gen_reg.py <输入Excel文件> [-o <输出Verilog文件或目录>] [-p]
 - `<输入Excel文件>`：寄存器描述 Excel 文件。
 - `-o`：输出 Verilog 文件路径；未指定时使用 Excel 中的 `module` 名称。
 - `-p`：将普通数组寄存器展开为独立寄存器实现。`RAM_RW` 与 `RAM_RO` 保持 RAM 表项接口生成，并输出 Warning。
+- `--pack_array`：普通数组寄存器的顶层端口使用压缩数组形式生成，例如 `input [63:0][15:0] ltssm_time`；内部访问方式不变。
 
 示例：
 
@@ -44,6 +45,7 @@ python autoreg.py <A表格.xlsx> -o <输出Verilog文件> --bus_type apb
 - `--bus_type`：选择 `apb` 或 `regbus`，默认 `apb`。
 - `-p`：传递给 `gen_reg.py`，展开普通数组寄存器。
 - `--keep_excel`：保留输出目录中的中间 B 表格 `mid.xlsx`；未指定时，成功生成 Verilog 后自动删除。
+- `--pack_array`：普通数组寄存器端口使用压缩数组形式，便于适配部分 SystemVerilog 工具；由于部分 Icarus Verilog 版本对多维 packed 端口支持不稳定，`autoreg.py` 会跳过 Icarus 自检并输出 Warning。
 - 指定 Verilog 文件时，模块名使用输出文件名（如 `-o sys_reg.v` 生成 `module sys_reg`）。
 - 转换或生成失败时，中间 B 表格会保留，便于定位问题。
 

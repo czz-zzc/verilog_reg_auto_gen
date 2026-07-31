@@ -51,6 +51,53 @@ class Field:
         self.sw_access = ""
         self.default = ""
 
+def format_array_port(direction, reg_keyword, width, name, depth, pack_array=False,
+                      packed_range_width=None):
+    """Format variable-register ports as unpacked or packed arrays."""
+    if pack_array:
+        if width == 1:
+            packed_range = f"[{depth}:0]"
+        else:
+            packed_range = f"[{depth}:0][{width - 1:02}:0]"
+        if packed_range_width is not None:
+            packed_range = f"{packed_range:<{packed_range_width}}"
+        if reg_keyword:
+            return f"{direction} {reg_keyword}  {packed_range}  {name},"
+        return f"{direction}       {packed_range}  {name},"
+
+    if width == 1:
+        if reg_keyword:
+            return f"{direction} {reg_keyword}          {name}[{depth}:0],"
+        return f"{direction}               {name}[{depth}:0],"
+    if reg_keyword:
+        return f"{direction} {reg_keyword}  [{width - 1:02}:0]  {name}[{depth}:0],"
+    return f"{direction}       [{width - 1:02}:0]  {name}[{depth}:0],"
+
+def align_module_port_names(port_lines):
+    """Align signal names in a module port list, including packed dimensions."""
+    port_pattern = re.compile(
+        r"^(?P<decl>(?:input|output)(?: reg)?)\s+"
+        r"(?:(?P<bit_range>(?:\[[^\]]+\])+)[ \t]+)?"
+        r"(?P<name>[^ \t,]+),$"
+    )
+    matched_ports = []
+    for index, line in enumerate(port_lines):
+        match = port_pattern.match(line)
+        if match:
+            matched_ports.append((index, match))
+
+    max_range_width = max(
+        (len(match.group("bit_range") or "") for _, match in matched_ports),
+        default=0,
+    )
+    for index, match in matched_ports:
+        declaration = match.group("decl")
+        bit_range = match.group("bit_range") or ""
+        port_lines[index] = (
+            f"{declaration:<12}{bit_range:<{max_range_width}}  {match.group('name')},"
+        )
+
+
 def calculate_bit_width(bit_str):
     bit_str = str(bit_str)  # fix: ensure bit_str is a string
     parts = bit_str.split(':')
@@ -429,7 +476,7 @@ def parse_excel(filename, parallel=False, module_name_override=None):
         expanded_registers.sort(key=lambda reg: int(reg.offset, 16))
         registers = expanded_registers
     return module_info, registers
-def generate_verilog(module_info, registers, filename):
+def generate_verilog(module_info, registers, filename, pack_array=False):
     now = datetime.now()
     code = []
     
@@ -439,6 +486,21 @@ def generate_verilog(module_info, registers, filename):
     ram_regs = [reg for reg in registers if is_ram_register(reg)]
     has_ram = bool(ram_regs)
     ram_select_signal = " | ".join(f"{reg.fields[0].name}_sel" for reg in ram_regs)
+    # Keep packed-array port names in one column even when their dimensions differ.
+    packed_range_width = None
+    if pack_array:
+        packed_ranges = []
+        for reg in registers:
+            if reg.var is not None and not is_ram_register(reg):
+                for field in reg.fields:
+                    if field.sw_access in ("RW", "WO", "W1P", "W1C", "RC", "RO"):
+                        if field.bits_size == 1:
+                            packed_ranges.append(f"[{reg.var_val}:0]")
+                        else:
+                            packed_ranges.append(
+                                f"[{reg.var_val}:0][{field.bits_size - 1:02}:0]"
+                            )
+        packed_range_width = max((len(item) for item in packed_ranges), default=0)
     # Header
     header_separator = "//------------------------------------------------------------------------------"
     code.append(header_separator)
@@ -487,25 +549,14 @@ def generate_verilog(module_info, registers, filename):
                 code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}_rdata,")
                 continue
             for field in reg.fields:
-                if field.sw_access in ("RW", "WO", "W1P"): 
-                    if field.bits_size == 1:
-                        code.append(f"output reg          {field.name}[{reg.var_val}:0],")
-                    else:
-                        code.append(f"output reg  [{field.bits_size-1:02}:0]  {field.name}[{reg.var_val}:0],")
+                if field.sw_access in ("RW", "WO", "W1P"):
+                    code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
                 elif field.sw_access in ("W1C", "RC"):
-                    if field.bits_size == 1:
-                        code.append(f"input               {field.name}_hw_en[{reg.var_val}:0],")
-                        code.append(f"input               {field.name}_hw_val[{reg.var_val}:0],")
-                        code.append(f"output reg          {field.name}[{reg.var_val}:0],")
-                    else:
-                        code.append(f"input               {field.name}_hw_en[{reg.var_val}:0],")
-                        code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}_hw_val[{reg.var_val}:0],")
-                        code.append(f"output reg  [{field.bits_size-1:02}:0]  {field.name}[{reg.var_val}:0],")
+                    code.append(format_array_port("input", "", 1, f"{field.name}_hw_en", reg.var_val, pack_array, packed_range_width))
+                    code.append(format_array_port("input", "", field.bits_size, f"{field.name}_hw_val", reg.var_val, pack_array, packed_range_width))
+                    code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
                 elif field.sw_access == "RO":
-                    if field.bits_size == 1:
-                        code.append(f"input               {field.name}[{reg.var_val}:0],")
-                    else:
-                        code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}[{reg.var_val}:0],")
+                    code.append(format_array_port("input", "", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
         else:# Non-variable registers                        
             for field in reg.fields:
                 if field.sw_access in ("RW", "WO", "W1P"): 
@@ -528,6 +579,7 @@ def generate_verilog(module_info, registers, filename):
                     else:
                         code.append(f"input       [{field.bits_size-1:02}:0]  {field.name},")
     
+    align_module_port_names(code)
     code[-1] = code[-1].rstrip(',')  # Remove last comma
     code.append(");\n")
     if is_apb:
@@ -689,7 +741,10 @@ def generate_verilog(module_info, registers, filename):
                 if field.bits_size == 1:
                     code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j];")
                 else:
-                    code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size -1}:0];")
+                    if pack_array:
+                        code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j*{field.bits_size} +: {field.bits_size}];")
+                    else:
+                        code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size -1}:0];")
             code.append("        end")
             code.append("    end")
             code.append("end\n")    
@@ -844,6 +899,7 @@ if __name__ == "__main__":
     parser.add_argument('input', help='Input Excel file')
     parser.add_argument('-o', '--output', help='Output path or file. Can be a directory path (generates module_name.v) or complete file path')
     parser.add_argument('-p', '--parallel', action='store_true', help='Enable parrllel implement for loop. Default by array implement')
+    parser.add_argument('--pack_array', action='store_true', help='Generate variable-register ports as packed arrays')
     args = parser.parse_args()
 
     try:
@@ -873,7 +929,7 @@ if __name__ == "__main__":
         # Default: generate in current directory
         output_file = f"{module_info['module']}.v"
     
-    verilog_code = generate_verilog(module_info, registers, os.path.basename(output_file).split('.')[0])
+    verilog_code = generate_verilog(module_info, registers, os.path.basename(output_file).split('.')[0], pack_array=args.pack_array)
     with open(output_file, 'w') as f:
         f.write(verilog_code)
     print(f"Successfully generated {output_file}")

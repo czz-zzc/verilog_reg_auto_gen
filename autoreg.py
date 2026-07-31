@@ -29,8 +29,12 @@ def resolve_verilog_path(output_file, module_name):
         return os.path.join(output_file, f'{module_name}.v')
     return output_file
 
-def check_verilog(verilog_file, module_name):
+def check_verilog(verilog_file, module_name, pack_array=False):
     """Compile the generated module when Icarus Verilog is available."""
+    if pack_array:
+        print('\033[33mWarning: --pack_array uses multidimensional packed ports; skipping Icarus Verilog check because some Icarus versions cannot elaborate them reliably.\033[0m')
+        return
+
     iverilog = shutil.which('iverilog')
     if not iverilog:
         print('\033[33mWarning: iverilog was not found; skipping Verilog compilation check.\033[0m')
@@ -60,6 +64,8 @@ def main():
                         help='Enable parallel implementation for ordinary arrays')
     parser.add_argument('--keep_excel', action='store_true',
                         help='Keep the intermediate B-format Excel table')
+    parser.add_argument('--pack_array', action='store_true',
+                        help='Generate variable-register ports as packed arrays')
     args = parser.parse_args()
 
     intermediate_file = None
@@ -82,10 +88,10 @@ def main():
         verilog_dir = os.path.dirname(verilog_file)
         if verilog_dir:
             os.makedirs(verilog_dir, exist_ok=True)
-        verilog_code = generate_verilog(b_module_info, b_registers, os.path.basename(verilog_file).split('.')[0])
+        verilog_code = generate_verilog(b_module_info, b_registers, os.path.basename(verilog_file).split('.')[0], pack_array=args.pack_array)
         with open(verilog_file, 'w', encoding='utf-8') as file:
             file.write(verilog_code)
-        check_verilog(verilog_file, b_module_info['module'])
+        check_verilog(verilog_file, b_module_info['module'], pack_array=args.pack_array)
         print(f'Successfully generated {verilog_file}')
     except (ValueError, OSError) as error:
         print(f'\033[31mError: {error}\033[0m', file=sys.stderr)
