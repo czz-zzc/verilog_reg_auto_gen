@@ -1,4 +1,4 @@
-﻿# Verilog 寄存器自动生成工具
+# Verilog 寄存器自动生成工具
 
 `gen_reg.py` 根据 Excel 寄存器描述生成 Verilog 寄存器模块，支持普通寄存器、数组寄存器及外部 RAM 表项，并可直接生成 regbus 或 APB 配置接口。
 
@@ -30,7 +30,7 @@ python gen_reg.py <B表格.xlsx> -o <输出Verilog文件>
 - A 表格的 `Offset Addr` 已按 byte 地址处理，转换时不会乘 4。
 - A 表格的 `Entry` 映射到 B 表格的 `repeat`，格式为 `<数量>*<byte步进>`。
 - `Entry` 的数量可为常数或变量；变量范围从第二张 `variables` sheet 读取。范围 `0-N` 转换为数量 `N+1`。
-- `Attribute` 直接映射 `RW/RO/W1P/W1C/RC/RAM_RW/RAM_RO`；`pulse` 映射为 `W1P`。
+- `Attribute` 直接映射 `RW/WO/RO/W1P/W1C/RC/RAM_RW/RAM_RO`；`pulse` 映射为 `W1P`。
 - 通过 `--bus_type apb` 或 `--bus_type regbus` 指定 B 表格的 `cfg_interface`，默认 `apb`。
 
 ## 一键生成
@@ -109,6 +109,7 @@ pready = 1'b1;
 | --- | --- |
 | `RW` | 软件可读写，写入遵循字节写掩码。 |
 | `RO` | 软件只读，数据由模块外部输入。 |
+| `WO` | 软件只写，写入逻辑与 `RW` 相同；读取返回 `0`。 |
 | `W1P` | 软件写入 `1` 时产生一个时钟周期的脉冲；读取返回 `0`。 |
 | `W1C` | 软件写入 `1` 清除对应位；硬件通过 `<field>_hw_en/_hw_val` 更新且优先级更高。 |
 | `RC` | 软件读取当前值后清零；硬件通过 `<field>_hw_en/_hw_val` 更新且优先级更高。 |

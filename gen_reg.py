@@ -1,4 +1,4 @@
-﻿#########################################################################################
+#########################################################################################
 # Engineer:         czz
 # Date:             2025-03-18
 # Version:          1.0
@@ -322,7 +322,7 @@ def parse_excel(filename, parallel=False, module_name_override=None):
     def finalize_register(reg):
         validate_ram_register(reg)
         validate_register_bit_ranges(reg)
-        sw_writable = any(field.sw_access in {'RW', 'W1P', 'W1C'} for field in reg.fields)
+        sw_writable = any(field.sw_access in {'RW', 'WO', 'W1P', 'W1C'} for field in reg.fields)
         reg.wr = 'w' if sw_writable else 'r'
         registers.append(reg)
 
@@ -382,7 +382,7 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                 raise ValueError(f'Duplicate field name found: {field.name}')
             field_name_set.add(field.name)
             field.sw_access = str(sw_access).strip().upper()
-            if field.sw_access not in ['RW', 'W1P', 'W1C', 'RO', 'RC', RAM_RW_ACCESS, RAM_RO_ACCESS]:
+            if field.sw_access not in ['RW', 'WO', 'W1P', 'W1C', 'RO', 'RC', RAM_RW_ACCESS, RAM_RO_ACCESS]:
                 raise ValueError(f'Invalid sw_access value: {field.sw_access}')
             field.default = cell_value(row, 'default')
             if field.sw_access not in RAM_ACCESS_TYPES and field.default is None:
@@ -487,7 +487,7 @@ def generate_verilog(module_info, registers, filename):
                 code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}_rdata,")
                 continue
             for field in reg.fields:
-                if field.sw_access == "RW" or field.sw_access == "W1P": 
+                if field.sw_access in ("RW", "WO", "W1P"): 
                     if field.bits_size == 1:
                         code.append(f"output reg          {field.name}[{reg.var_val}:0],")
                     else:
@@ -508,7 +508,7 @@ def generate_verilog(module_info, registers, filename):
                         code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}[{reg.var_val}:0],")
         else:# Non-variable registers                        
             for field in reg.fields:
-                if field.sw_access == "RW" or field.sw_access == "W1P": 
+                if field.sw_access in ("RW", "WO", "W1P"): 
                     if field.bits_size == 1:
                         code.append(f"output reg          {field.name},")
                     else:
@@ -638,7 +638,7 @@ def generate_verilog(module_info, registers, filename):
                     code.append("\ngenvar i;")
                     gvar_i_declared = True
                 for field in reg.fields:
-                    if field.sw_access not in ("RW", "W1P", "W1C", "RC"):
+                    if field.sw_access not in ("RW", "WO", "W1P", "W1C", "RC"):
                         continue
                     code.append( "//============================================================================")
                     code.append(f"// {field.name} addr:{_addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] default:{field.default}")
@@ -649,7 +649,7 @@ def generate_verilog(module_info, registers, filename):
                     code.append(f"            if (!rst_n)")
                     code.append(f"                {field.name}[i] <= {field.default};")
                     code.append(f"            else begin")
-                    if field.sw_access == "RW":
+                    if field.sw_access in ("RW", "WO"):
                         code.append(f"                if (wr_en_{reg.reg_name}[i] == 1'b1)")
                         if field.bits_size == 1:
                             code.append(f"                    {field.name}[i] <= ({field.name}[i] & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
@@ -684,6 +684,8 @@ def generate_verilog(module_info, registers, filename):
             code.append(f"    for(j = 0; j <= {reg.var_val}; j = j + 1) begin:rdata_loop_{reg.reg_name}")
             code.append(f"        if (reg_addr[{_addr_width-1}:0] == {_addr_width}'h{reg.offset} + {_addr_width}'h{reg.var_step} * j) begin")
             for field in reg.fields:
+                if field.sw_access == "WO":
+                    continue
                 if field.bits_size == 1:
                     code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j];")
                 else:
@@ -704,7 +706,7 @@ def generate_verilog(module_info, registers, filename):
                     else:
                         code.append(f"        {field.name}[{field.bits_size-1}:0] <= {field.default};")
                     code.append("    else begin")
-                    if field.sw_access == "RW":
+                    if field.sw_access in ("RW", "WO"):
                         code.append(f"        if (wr_en_{reg.reg_name} == 1'b1)")
                         if field.bits_size == 1:
                             code.append(f"            {field.name} <= ({field.name} & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
@@ -777,7 +779,7 @@ def generate_verilog(module_info, registers, filename):
             addr = reg.offset
             code.append(f"    {_addr_width}'h{addr}: begin")
             for field in reg.fields:
-                if field.sw_access == "W1P":
+                if field.sw_access in ("WO", "W1P"):
                     code.append(f"        rd_data_nxt[{field.bits}] = {field.bits_size}'h0;")
                 else:
                     if field.bits_size == 1:
