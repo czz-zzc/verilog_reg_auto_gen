@@ -524,7 +524,6 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
         code.append( "input       [31:0]  pwdata,")
         code.append( "output      [31:0]  prdata,")
         code.append( "output              pready,")
-        code.append( "output              pslverr,")
     else:
         code.append( "input               clk,")
         code.append( "input               rst_n,")
@@ -605,7 +604,6 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
         code.append("assign wr_data  = pwdata;")
         code.append("assign prdata   = rd_data;")
         code.append("assign pready   = 1'b1;")
-        code.append("assign pslverr  = 1'b0;")
         code.append("")
     
     # Register and wire declarations
@@ -743,10 +741,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                 if field.bits_size == 1:
                     code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j];")
                 else:
-                    if pack_array:
-                        code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j*{field.bits_size} +: {field.bits_size}];")
-                    else:
-                        code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size -1}:0];")
+                    code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size - 1}:0];")
             code.append("        end")
             code.append("    end")
             code.append("end\n")    
