@@ -669,7 +669,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                     code.append("\ngenvar i;")
                     gvar_i_declared = True
                 code.append("generate")
-                code.append(f"    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_{reg.reg_name}")
+                code.append(f"    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_en_gen_{reg.reg_name}")
                 code.append(f"        assign wr_en_{reg.reg_name}[i]= wr_en & (reg_addr[{_addr_width-1}:0] == {_addr_width}'h{reg.offset} + {_addr_width}'h{reg.var_step} * i );")
                 code.append(f"    end")
                 code.append("endgenerate")
@@ -698,7 +698,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                     code.append(f"// {field.name} addr:{_addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] default:{field.default}")
                     code.append("//============================================================================")
                     code.append("generate")
-                    code.append(f"    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_{field.name}")
+                    code.append(f"    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_field_{field.name}")
                     code.append(f"        always @(posedge clk or negedge rst_n) begin")
                     code.append(f"            if (!rst_n)")
                     code.append(f"                {field.name}[i] <= {field.default};")
