@@ -56,9 +56,9 @@ def format_array_port(direction, reg_keyword, width, name, depth, pack_array=Fal
     """Format variable-register ports as unpacked or packed arrays."""
     if pack_array:
         if width == 1:
-            packed_range = f"[{depth}:0]"
+            packed_range = f"[{depth:02}:0]"
         else:
-            packed_range = f"[{depth}:0][{width - 1:02}:0]"
+            packed_range = f"[{depth:02}:0][{width - 1:02}:0]"
         if packed_range_width is not None:
             packed_range = f"{packed_range:<{packed_range_width}}"
         if reg_keyword:
@@ -67,11 +67,11 @@ def format_array_port(direction, reg_keyword, width, name, depth, pack_array=Fal
 
     if width == 1:
         if reg_keyword:
-            return f"{direction} {reg_keyword}          {name}[{depth}:0],"
-        return f"{direction}               {name}[{depth}:0],"
+            return f"{direction} {reg_keyword}          {name}[{depth:02}:0],"
+        return f"{direction}               {name}[{depth:02}:0],"
     if reg_keyword:
-        return f"{direction} {reg_keyword}  [{width - 1:02}:0]  {name}[{depth}:0],"
-    return f"{direction}       [{width - 1:02}:0]  {name}[{depth}:0],"
+        return f"{direction} {reg_keyword}  [{width - 1:02}:0]  {name}[{depth:02}:0],"
+    return f"{direction}       [{width - 1:02}:0]  {name}[{depth:02}:0],"
 
 def align_module_port_names(port_lines):
     """Align signal names in a module port list, including packed dimensions."""
@@ -495,10 +495,10 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                 for field in reg.fields:
                     if field.sw_access in ("RW", "WO", "W1P", "W1C", "RC", "RO"):
                         if field.bits_size == 1:
-                            packed_ranges.append(f"[{reg.var_val}:0]")
+                            packed_ranges.append(f"[{reg.var_val:02}:0]")
                         else:
                             packed_ranges.append(
-                                f"[{reg.var_val}:0][{field.bits_size - 1:02}:0]"
+                                f"[{reg.var_val:02}:0][{field.bits_size - 1:02}:0]"
                             )
         packed_range_width = max((len(item) for item in packed_ranges), default=0)
     # Header
@@ -631,7 +631,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                 code.append(f"reg  [31:0]    rd_data_nxt_{reg.reg_name};")
             else:
                 code.append(f"reg  [31:0]    rd_data_nxt_{reg.reg_name};")
-                code.append(f"wire           wr_en_{reg.reg_name}[{reg.var_val}:0];")
+                code.append(f"wire           wr_en_{reg.reg_name}[{reg.var_val:02}:0];")
         else:
             if reg.wr == 'w':
                 code.append(f"wire           wr_en_{reg.reg_name};")
@@ -654,7 +654,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     for reg in registers:
         if reg.wr == 'w':
             if reg.var is not None:
-                lhs_length = len(f"wr_en_{reg.reg_name}[{reg.var_val}]")
+                lhs_length = len(f"wr_en_{reg.reg_name}[{reg.var_val:02}]")
             else:
                 lhs_length = len(f"wr_en_{reg.reg_name}")
             if lhs_length > max_lhs_length:
