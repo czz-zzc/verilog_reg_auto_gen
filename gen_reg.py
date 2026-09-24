@@ -792,17 +792,23 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     for reg in ram_regs:
         field = reg.fields[0]
         ram_addr_width = max(1, reg.var_val.bit_length())
-        table_last_offset = hex(int(reg.offset, 16) + reg.var_val * int(reg.var_step, 16))[2:]
+        ram_step = int(reg.var_step, 16)
+        ram_step_mask = ram_step - 1
         code.append("//============================================================================")
         code.append(f"// {field.name} addr:{_addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] depth:{reg.var_val + 1}")
         code.append("//============================================================================")
-        code.append(f"assign {field.name}_sel   = (reg_addr >={_addr_width}'h{reg.offset}) && (reg_addr <= {_addr_width}'h{reg.offset}+ {reg.var_val} * {_addr_width}'h{reg.var_step});")
+        code.append(
+            f"assign {field.name}_sel   = "
+            f"(reg_addr >= {_addr_width}'h{reg.offset}) && "
+            f"(reg_addr <= {_addr_width}'h{reg.offset} + {reg.var_val} * {_addr_width}'h{reg.var_step}) && "
+            f"(((reg_addr - {_addr_width}'h{reg.offset}) & {_addr_width}'h{ram_step_mask:x}) == {_addr_width}'h0);"
+        )
         if field.sw_access == RAM_RW_ACCESS:
             code.append(f"assign {field.name}_en    = {field.name}_sel  & (wr_en | rd_en);")
             code.append(f"assign {field.name}_we    = {field.name}_sel  & wr_en;")
         else:
             code.append(f"assign {field.name}_en    = {field.name}_sel  & rd_en;")
-        code.append(f"assign {field.name}_addr  = (reg_addr - {_addr_width}'h{reg.offset}) >> {int(reg.var_step, 16).bit_length() - 1};")
+        code.append(f"assign {field.name}_addr  = (reg_addr - {_addr_width}'h{reg.offset}) >> {ram_step.bit_length() - 1};")
         if field.sw_access == RAM_RW_ACCESS:
             code.append(f"assign {field.name}_wdata = wr_data[{field.bits_size-1}:0];")
             code.append(f"assign {field.name}_wmask = msk[{field.bits_size-1}:0];")
