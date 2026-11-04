@@ -66,7 +66,11 @@ def main():
                         help='Keep the intermediate B-format Excel table')
     parser.add_argument('--pack_array', action='store_true',
                         help='Generate variable-register ports as packed arrays')
+    parser.add_argument('--table_pending', action='store_true',
+                        help='Use RAM table ready handshakes (APB only)')
     args = parser.parse_args()
+    if args.table_pending and args.bus_type != 'apb':
+        parser.error('--table_pending requires --bus_type apb')
 
     intermediate_file = None
     try:
@@ -88,7 +92,7 @@ def main():
         verilog_dir = os.path.dirname(verilog_file)
         if verilog_dir:
             os.makedirs(verilog_dir, exist_ok=True)
-        verilog_code = generate_verilog(b_module_info, b_registers, os.path.basename(verilog_file).split('.')[0], pack_array=args.pack_array)
+        verilog_code = generate_verilog(b_module_info, b_registers, os.path.basename(verilog_file).split('.')[0], pack_array=args.pack_array, table_pending=args.table_pending)
         with open(verilog_file, 'w', encoding='utf-8') as file:
             file.write(verilog_code)
         check_verilog(verilog_file, b_module_info['module'], pack_array=args.pack_array)

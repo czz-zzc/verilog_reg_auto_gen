@@ -10,14 +10,16 @@ import os
 import re
 
 import openpyxl
+from register_features import (SUPPORTED_ACCESS, info_feature_text, normalize_access, parse_info_features,
+                               parse_interrupt_group, validate_feature_specs,
+                               validate_interrupt_specs)
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
 B_HEADERS = [
     'offset', 'repeat', 'reg_name', 'bits', 'field',
-    'sw_access', 'hw_access', 'default', 'attribute', 'description',
+    'sw_access', 'hw_access', 'default', 'attribute', 'description', 'info',
 ]
-SUPPORTED_ACCESS = {'RW', 'WO', 'RO', 'W1P', 'W1C', 'RC', 'RAM_RW', 'RAM_RO'}
 
 
 def normalize_header(value):
@@ -78,16 +80,20 @@ def parse_default_value(default_value, bit_width):
 
 
 def convert_attribute_to_sw_access(attribute):
-    """Map A-table attributes to B-table software-access values."""
+    """Map a supported A-table attribute to a B-table software-access value."""
     if attribute is None or str(attribute).strip() == '':
         return 'RW'
 
-    access = str(attribute).strip().upper()
-    if access == 'PULSE':
-        return 'W1P'
-    if access not in SUPPORTED_ACCESS:
-        raise ValueError(f'Unsupported Attribute value: {attribute!r}')
-    return access
+    access = normalize_access(attribute)
+    return access if access in SUPPORTED_ACCESS else None
+
+
+def warn_skipped_register(reg_name, field_name, attribute, row_number):
+    """Report an unsupported field access and the affected skipped register."""
+    print(
+        f"\033[33mWarning: Skipping register {reg_name!r}: field {field_name!r} "
+        f"uses unsupported Attribute {attribute!r} at A table row {row_number}.\033[0m"
+    )
 
 
 def find_table_header(ws):
@@ -99,52 +105,85 @@ def find_table_header(ws):
     raise ValueError("A table header containing 'Reg Name' and 'Offset Addr' was not found")
 
 
+def find_register_sheet(wb):
+    """Find the A-table worksheet by its required Module metadata label."""
+    matches = []
+    for ws in wb.worksheets:
+        has_module_label = any(
+            row and normalize_header(row[0]) == 'module'
+            for row in ws.iter_rows(values_only=True)
+        )
+        if not has_module_label:
+            continue
+
+        try:
+            header_row, columns = find_table_header(ws)
+        except ValueError as error:
+            raise ValueError(
+                f"Worksheet {ws.title!r} contains 'Module' but has no valid A-table header"
+            ) from error
+        matches.append((ws, header_row, columns))
+
+    if not matches:
+        raise ValueError("No worksheet containing the required 'Module' label was found")
+    if len(matches) > 1:
+        names = ', '.join(ws.title for ws, _, _ in matches)
+        raise ValueError(f"Multiple worksheets containing 'Module' were found: {names}")
+    return matches[0]
+
+
 def cell_value(row, columns, name):
     index = columns.get(name)
     return row[index] if index is not None and index < len(row) else None
 
 
-def parse_variable_ranges(wb):
-    """Read variable ranges such as a: 0-3 from A table's variables sheet."""
-    if len(wb.worksheets) < 2:
-        return {}
-
-    ws = wb.worksheets[1]
-    header_row = None
-    columns = {}
-    for row_number, row in enumerate(ws.iter_rows(values_only=True), start=1):
-        headers = [normalize_header(value) for value in row]
-        name_aliases = {'name', 'variable_name', '变量名称'}
-        range_aliases = {'range', 'variable_range', '变量范围'}
-        name_index = next((index for index, header in enumerate(headers) if header in name_aliases), None)
-        range_index = next((index for index, header in enumerate(headers) if header in range_aliases), None)
-        if name_index is not None and range_index is not None:
-            header_row = row_number
-            columns = {'name': name_index, 'range': range_index}
-            break
-
-    if header_row is None:
-        return {}
-
+def parse_variable_ranges(wb, register_ws):
+    """Read variable ranges from any non-register worksheet in an A table workbook."""
     ranges = {}
-    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-        name = cell_value(row, columns, 'name')
-        range_value = cell_value(row, columns, 'range')
-        if name is None or str(name).strip() == '':
-            continue
-        if range_value is None or str(range_value).strip() == '':
-            raise ValueError(f"Variable {name!r} has no range")
+    name_aliases = {'name', 'variable_name', '\u53d8\u91cf\u540d\u79f0'}
+    range_aliases = {'range', 'variable_range', '\u53d8\u91cf\u8303\u56f4'}
 
-        match = re.fullmatch(r'\s*(\d+)\s*(?:~|-)\s*(\d+)\s*', str(range_value))
-        if not match:
-            raise ValueError(f"Invalid range {range_value!r} for variable {name!r}; expected 0-N")
-        lower, upper = map(int, match.groups())
-        if lower != 0 or upper < lower:
-            raise ValueError(f"Variable {name!r} range must start at 0, got {range_value!r}")
-        ranges[str(name).strip()] = upper
+    for ws in wb.worksheets:
+        if ws is register_ws:
+            continue
+
+        header_row = None
+        columns = {}
+        for row_number, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            headers = [normalize_header(value) for value in row]
+            name_index = next((index for index, header in enumerate(headers) if header in name_aliases), None)
+            range_index = next((index for index, header in enumerate(headers) if header in range_aliases), None)
+            if name_index is not None and range_index is not None:
+                header_row = row_number
+                columns = {'name': name_index, 'range': range_index}
+                break
+
+        if header_row is None:
+            continue
+
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            name = cell_value(row, columns, 'name')
+            range_value = cell_value(row, columns, 'range')
+            if name is None or str(name).strip() == '':
+                continue
+            if range_value is None or str(range_value).strip() == '':
+                raise ValueError(f"Variable {name!r} in sheet {ws.title!r} has no range")
+
+            match = re.fullmatch(r'\s*(\d+)\s*(?:~|-)\s*(\d+)\s*', str(range_value))
+            if not match:
+                raise ValueError(
+                    f"Invalid range {range_value!r} for variable {name!r} in sheet {ws.title!r}; expected 0-N"
+                )
+            lower, upper = map(int, match.groups())
+            if lower != 0 or upper < lower:
+                raise ValueError(f"Variable {name!r} range must start at 0, got {range_value!r}")
+
+            variable_name = str(name).strip()
+            if variable_name in ranges:
+                raise ValueError(f"Variable {variable_name!r} is defined more than once")
+            ranges[variable_name] = upper
 
     return ranges
-
 
 def parse_entry(entry_value, variable_ranges, reg_name):
     """Map A entry '<count-or-variable>*<byte-step>' to B repeat '<count>*<step>'."""
@@ -182,9 +221,8 @@ def parse_new_format(filename, bus_type='apb'):
     if not wb.worksheets:
         raise ValueError('A table workbook contains no worksheets')
 
-    ws = wb.worksheets[0]
-    header_row, columns = find_table_header(ws)
-    variable_ranges = parse_variable_ranges(wb)
+    ws, header_row, columns = find_register_sheet(wb)
+    variable_ranges = parse_variable_ranges(wb, ws)
 
     metadata = {}
     for row in ws.iter_rows(max_row=header_row - 1, values_only=True):
@@ -201,7 +239,7 @@ def parse_new_format(filename, bus_type='apb'):
     module_info = {
         'module': str(metadata['module']).strip(),
         'owner': 'czz',
-        'size': '4KB',
+        'size': '64KB',
         'cfg_interface': bus_type,
         'base_addr': metadata.get('base_addr', "32'h0000"),
         'addr_width': parse_integer(metadata.get('id', 12), 'ID'),
@@ -220,7 +258,7 @@ def parse_new_format(filename, bus_type='apb'):
         if has_register or has_offset:
             if not (has_register and has_offset):
                 raise ValueError(f'Register name and Offset Addr must both be set in A table row {row_number}')
-            if current_reg:
+            if current_reg and not current_reg['skip']:
                 registers.append(current_reg)
 
             reg_name = str(reg_name_value).strip()
@@ -233,34 +271,69 @@ def parse_new_format(filename, bus_type='apb'):
                 'reg_name': reg_name,
                 'reg_description': cell_value(row, columns, 'reg_description'),
                 'fields': [],
+                'skip': False,
+                'filtered_fields': False,
             }
 
         bits = cell_value(row, columns, 'bits')
         field_name = cell_value(row, columns, 'field_name')
         if field_name is not None and str(field_name).strip() != '':
+            info = cell_value(row, columns, 'info')
+            if 'NO_RTL_GEN' in info_feature_text(info).upper():
+                if current_reg is not None:
+                    current_reg['filtered_fields'] = True
+                continue
             if current_reg is None:
                 raise ValueError(f'Field is defined before a register in A table row {row_number}')
+
+            attribute = cell_value(row, columns, 'attribute')
+            sw_access = convert_attribute_to_sw_access(attribute)
+            if sw_access is None:
+                if parse_info_features(info) or parse_interrupt_group(info) is not None:
+                    raise ValueError(f'Unsupported Attribute {attribute!r} on feature-marked field {field_name!r}')
+                if not current_reg['skip']:
+                    warn_skipped_register(
+                        current_reg['reg_name'], str(field_name).strip(), attribute, row_number
+                    )
+                    current_reg['skip'] = True
+                    current_reg['fields'].clear()
+                continue
+            if current_reg['skip']:
+                continue
+
             bit_width = calculate_bit_width(bits)
             field_description = cell_value(row, columns, 'field_description')
             description = field_description if field_description not in (None, '') else current_reg['reg_description']
             current_reg['fields'].append({
                 'bits': str(bits).strip(),
                 'field': str(field_name).strip(),
-                'sw_access': convert_attribute_to_sw_access(cell_value(row, columns, 'attribute')),
+                'sw_access': sw_access,
                 'hw_access': '',
-                'default': parse_default_value(cell_value(row, columns, 'default_value'), bit_width),
+                'default': None if sw_access == 'RCI' else parse_default_value(cell_value(row, columns, 'default_value'), bit_width),
                 'attribute': '',
                 'description': description or '',
+                'info': str(info).strip() if info is not None else '',
             })
 
-    if current_reg:
+    if current_reg and not current_reg['skip']:
         registers.append(current_reg)
-    if not registers:
-        raise ValueError('A table contains no registers')
+    registers = [reg for reg in registers if reg['fields'] or not reg['filtered_fields']]
     for reg in registers:
         if not reg['fields']:
             raise ValueError(f"Register {reg['reg_name']!r} has no fields")
 
+    validate_feature_specs(
+        (field['field'], field['sw_access'], calculate_bit_width(field['bits']),
+         reg['repeat'] is not None, parse_info_features(field.get('info')))
+        for reg in registers for field in reg['fields']
+    )
+    validate_interrupt_specs(
+        (parse_interrupt_group(field.get('info')), None, field['field'], field['sw_access'],
+         calculate_bit_width(field['bits']),
+         int(reg['repeat'].split('*')[0]) if reg['repeat'] is not None else None,
+         parse_info_features(field.get('info')))
+        for reg in registers for field in reg['fields']
+    )
     return module_info, registers
 
 
@@ -309,9 +382,10 @@ def write_b_format(module_info, registers, output_file):
             ws.cell(row=output_row, column=8, value=field['default'])
             ws.cell(row=output_row, column=9, value=field['attribute'])
             ws.cell(row=output_row, column=10, value=field['description'])
+            ws.cell(row=output_row, column=11, value=field.get('info', ''))
             output_row += 1
 
-    for column, width in {'A': 16, 'B': 14, 'C': 28, 'D': 12, 'E': 28, 'F': 14, 'G': 14, 'H': 16, 'I': 14, 'J': 36}.items():
+    for column, width in {'A': 16, 'B': 14, 'C': 28, 'D': 12, 'E': 28, 'F': 14, 'G': 14, 'H': 16, 'I': 14, 'J': 36, 'K': 32}.items():
         ws.column_dimensions[column].width = width
 
     wb.save(output_file)

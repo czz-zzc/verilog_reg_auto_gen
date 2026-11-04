@@ -11,6 +11,13 @@ from datetime import datetime
 import argparse
 import os
 import sys
+from register_features import (SOFTWARE_WRITABLE, SUPPORTED_ACCESS, normalize_access,
+                               parse_info_features, parse_interrupt_group,
+                               validate_feature_specs, validate_interrupt_specs)
+from wide_registers import (WIDE_ACCESS, is_wide_register, word_count,
+                            emit_wide_declarations, emit_wide_decode, emit_wide_storage,
+                            emit_wide_read_cases, emit_wide_array_read,
+                            emit_wide_ram_declarations, emit_wide_ram)
 def parse_offset_address(expression):
     """Parse an offset cell; the new Excel format accepts a base address only."""
     value = str(expression).strip()
@@ -50,6 +57,10 @@ class Field:
         self.name = ""
         self.sw_access = ""
         self.default = ""
+        self.info = ""
+        self.features = frozenset()
+        self.int_group = None
+        self.int_index = None
 
 def format_array_port(direction, reg_keyword, width, name, depth, pack_array=False,
                       packed_range_width=None):
@@ -182,10 +193,22 @@ def validate_register_bit_ranges(reg):
     """Reject invalid or overlapping field bit ranges within one register."""
     bit_owners = {}
 
+    if is_wide_register(reg):
+        if len(reg.fields) != 1:
+            raise ValueError(f'Wide register {reg.reg_name!r} must contain exactly one field')
+        field = reg.fields[0]
+        if field.sw_access not in WIDE_ACCESS:
+            raise ValueError(f'Wide field {field.name!r} only supports RW, RO, RAM_RW or RAM_RO')
+        if tuple(int(part) for part in str(field.bits).split(':')) != (field.bits_size-1, 0):
+            raise ValueError(f'Wide field {field.name!r} must use Bits={field.bits_size-1}:0')
+        if field.sw_access not in RAM_ACCESS_TYPES:
+            validate_default_value(field)
+        return
+
     for field in reg.fields:
         bit_str = str(field.bits).strip()
         field_bits = parse_field_bit_range(bit_str)
-        if field.sw_access not in RAM_ACCESS_TYPES:
+        if field.sw_access not in RAM_ACCESS_TYPES | {'RCI'}:
             validate_default_value(field)
         overlaps = [(bit, bit_owners[bit]) for bit in field_bits if bit in bit_owners]
         if overlaps:
@@ -245,6 +268,7 @@ def validate_register_addresses(registers, module_size, addr_width):
 
     for reg in registers:
         base_address = int(reg.offset, 16)
+        register_bytes = word_count(reg) * bytes_per_register if is_wide_register(reg) else bytes_per_register
         if reg.var is None:
             indices = [0]
             step = 0
@@ -254,11 +278,13 @@ def validate_register_addresses(registers, module_size, addr_width):
             step = int(reg.var_step, 16)
             if step <= 0:
                 raise ValueError(f"Address step of register {reg.reg_name!r} must be positive")
+            if is_wide_register(reg) and step < register_bytes:
+                raise ValueError(f'Address step of register {reg.reg_name!r} must be at least {register_bytes} bytes')
             indices = range(reg.var_val + 1)
 
         for index in indices:
             address = base_address + index * step
-            last_byte_address = address + bytes_per_register - 1
+            last_byte_address = address + register_bytes - 1
             owner = describe_address_owner(reg, index)
 
             if address % bytes_per_register:
@@ -369,7 +395,7 @@ def parse_excel(filename, parallel=False, module_name_override=None):
     def finalize_register(reg):
         validate_ram_register(reg)
         validate_register_bit_ranges(reg)
-        sw_writable = any(field.sw_access in {'RW', 'WO', 'W1P', 'W1C'} for field in reg.fields)
+        sw_writable = any(field.sw_access in SOFTWARE_WRITABLE for field in reg.fields)
         reg.wr = 'w' if sw_writable else 'r'
         registers.append(reg)
 
@@ -428,11 +454,14 @@ def parse_excel(filename, parallel=False, module_name_override=None):
             if field.name in field_name_set:
                 raise ValueError(f'Duplicate field name found: {field.name}')
             field_name_set.add(field.name)
-            field.sw_access = str(sw_access).strip().upper()
-            if field.sw_access not in ['RW', 'WO', 'W1P', 'W1C', 'RO', 'RC', RAM_RW_ACCESS, RAM_RO_ACCESS]:
+            field.sw_access = normalize_access(sw_access)
+            if field.sw_access not in SUPPORTED_ACCESS:
                 raise ValueError(f'Invalid sw_access value: {field.sw_access}')
             field.default = cell_value(row, 'default')
-            if field.sw_access not in RAM_ACCESS_TYPES and field.default is None:
+            field.info = cell_value(row, 'info') if 'info' in header_columns else ''
+            field.features = parse_info_features(field.info)
+            field.int_group = parse_interrupt_group(field.info)
+            if field.sw_access not in RAM_ACCESS_TYPES | {'RCI'} and field.default is None:
                 raise ValueError(f'Default value not found for field {field.name!r}')
             current_reg.fields.append(field)
 
@@ -440,6 +469,11 @@ def parse_excel(filename, parallel=False, module_name_override=None):
         finalize_register(current_reg)
 
     validate_register_addresses(registers, module_size=module_size, addr_width=addr_width)
+    validate_feature_specs(
+        (field.name, field.sw_access, field.bits_size, reg.var is not None, field.features)
+        for reg in registers for field in reg.fields
+    )
+    collect_interrupt_groups(registers)
 
     if parallel == True:
         ram_tables = [reg for reg in registers if is_ram_register(reg)]
@@ -469,6 +503,10 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                         new_field.name = f"{reg.var}{i}_{field.name}"
                         new_field.sw_access = field.sw_access
                         new_field.default = field.default
+                        new_field.info = field.info
+                        new_field.features = field.features
+                        new_field.int_group = field.int_group
+                        new_field.int_index = i if field.int_group is not None else None
                         new_reg.fields.append(new_field)
                     expanded_registers.append(new_reg)
             else:
@@ -476,15 +514,173 @@ def parse_excel(filename, parallel=False, module_name_override=None):
         expanded_registers.sort(key=lambda reg: int(reg.offset, 16))
         registers = expanded_registers
     return module_info, registers
-def generate_verilog(module_info, registers, filename, pack_array=False):
+def collect_interrupt_groups(registers):
+    return validate_interrupt_specs(
+        (field.int_group, field.int_index, field.name, field.sw_access, field.bits_size,
+         reg.var_val + 1 if reg.var is not None else None, field.features)
+        for reg in registers for field in reg.fields
+    )
+
+
+def is_internal_field(field):
+    return ('LOCK_GEN' in field.features or
+            (field.int_group is not None and field.sw_access in {'RW', 'W1P'}))
+
+
+EXTENDED_ACCESS = {'EVENT', 'ONE_SHOT', 'RWW', 'CNT', 'RCNT'}
+
+
+def emit_extended_storage(code, reg, field, addr_width, write_allowed, test_field=None):
+    """Emit identical masked-write and hardware-priority rules for scalars and arrays."""
+    code.append('//============================================================================')
+    code.append(f"// {field.name} addr:{addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] default:{field.default}")
+    code.append('//============================================================================')
+    suffix = '[i]' if reg.var is not None else ''
+    if reg.var is not None:
+        code.append('generate')
+        code.append(f'    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_field_{field.name}')
+    body_start = len(code)
+    value = field.name + suffix
+    enable = f'wr_en_{reg.reg_name}{suffix}'
+    if write_allowed:
+        enable = f'({enable} & autoreg_write_allowed)'
+    data = f'wr_data[{field.bits}] & msk[{field.bits}]'
+    merged = f'({value} & ~msk[{field.bits}]) | ({data})'
+    code.append('always @(posedge clk or negedge rst_n) begin')
+    code.append('    if (!rst_n)')
+    code.append(f'        {value} <= {field.default};')
+    code.append('    else begin')
+    if field.sw_access == 'EVENT':
+        set_value = f'{field.name}_hw_set{suffix}'
+        if test_field is not None:
+            set_value += f' | {test_field}{suffix}'
+            code.append('        // Hardware and software-test set take priority over software clear')
+        else:
+            code.append('        // Hardware set takes priority on each bit')
+        code.append(f"        if ({enable} == 1'b1)")
+        code.append(f'            {value} <= ({value} & ~({data})) | {set_value};')
+        code.append('        else')
+        code.append(f'            {value} <= {value} | {set_value};')
+    elif field.sw_access == 'ONE_SHOT':
+        clear = f'{field.name}_hw_clr{suffix}'
+        code.append('        // Hardware clear takes priority on each bit')
+        code.append(f"        if ({enable} == 1'b1)")
+        code.append(f'            {value} <= ({value} | ({data})) & ~{clear};')
+        code.append('        else')
+        code.append(f'            {value} <= {value} & ~{clear};')
+    elif field.sw_access == 'RWW':
+        code.append(f"        if ({field.name}_hw_en{suffix} == 1'b1)")
+        code.append(f'            {value} <= {field.name}_hw_val{suffix};')
+        code.append(f"        else if ({enable} == 1'b1)")
+        code.append(f'            {value} <= {merged};')
+    else:
+        code.append('        // An effective software write takes priority over hardware increment')
+        code.append(f'        if (({enable}) && (|msk[{field.bits}]))')
+        code.append(f'            {value} <= {merged};')
+        increment = f'{field.name}_hw_inc{suffix}'
+        if field.sw_access == 'CNT':
+            increment += f' && !(&{value})'
+        code.append(f'        else if ({increment})')
+        code.append(f"            {value} <= {value} + {field.bits_size}'d1;")
+    code.append('    end')
+    code.append('end')
+    if reg.var is not None:
+        code[body_start:] = ['        ' + line if line else '' for line in code[body_start:]]
+        code.append('    end')
+        code.append('endgenerate')
+    code.append('')
+
+
+def emit_parity_storage(code, reg, field, write_allowed):
+    """Store independent even parity, updating only on accepted masked writes."""
+    code.append('')
+    code.append('//============================================================================')
+    code.append(f'// {field.name} register write and even parity')
+    code.append('//============================================================================')
+    if reg.var is not None:
+        code.append('generate')
+        code.append(f'    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: wr_parity_field_{field.name}')
+    body_start = len(code)
+    indices = ['i'] if reg.var is not None else [None]
+    for index in indices:
+        suffix = f'[{index}]' if index is not None else ''
+        value = f'{field.name}{suffix}'
+        next_value = f'{field.name}_next{suffix}'
+        parity = f'{field.name}_parity{suffix}'
+        enable = f'wr_en_{reg.reg_name}{suffix}'
+        if write_allowed and 'LOCK_GEN' not in field.features:
+            enable += ' & autoreg_write_allowed'
+        code.append(f'assign {next_value} = ({value} & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);')
+        code.append('always @(posedge clk or negedge rst_n) begin')
+        code.append('    if (!rst_n) begin')
+        code.append(f'        {value} <= {field.default};')
+        code.append(f'        {parity} <= ^({field.default});')
+        code.append(f'    end else if (({enable}) && (|msk[{field.bits}])) begin')
+        code.append(f'        {value} <= {next_value};')
+        code.append(f'        {parity} <= ^{next_value};')
+        code.append('    end')
+        code.append('end')
+        code.append('')
+        code.append('// Registered parity error; the safety island handles aggregation')
+        code.append('always @(posedge clk or negedge rst_n) begin')
+        code.append('    if (!rst_n)')
+        code.append(f"        parity_err_{field.name}{suffix} <= 1'b0;")
+        code.append('    else')
+        code.append(f'        parity_err_{field.name}{suffix} <= (^{value}) ^ {parity};')
+        code.append('end')
+    if reg.var is not None:
+        code[body_start:] = ['        ' + line if line else '' for line in code[body_start:]]
+        code.append('    end')
+        code.append('endgenerate')
+    code.append('')
+
+
+def generate_verilog(module_info, registers, filename, pack_array=False, table_pending=False):
     now = datetime.now()
     code = []
     
     _addr_width = int(module_info.get('addr_width', '12'))
     cfg_interface = str(module_info.get('cfg_interface', 'regbus')).strip().lower()
     is_apb = cfg_interface == 'apb'
+    if table_pending and not is_apb:
+        raise ValueError('--table_pending requires an APB configuration interface')
     ram_regs = [reg for reg in registers if is_ram_register(reg)]
     has_ram = bool(ram_regs)
+    interrupt_groups = collect_interrupt_groups(registers)
+    interrupt_tests = {members['EVENT'][0]: members['W1P'][0]
+                       for members in interrupt_groups.values()}
+    for reg in registers:
+        for field in reg.fields:
+            if field.sw_access == 'WO':
+                print(f"\033[33mWarning: WO field {field.name!r} in register {reg.reg_name!r} is write-only; reads return zero.\033[0m", file=sys.stderr)
+    validate_feature_specs(
+        (field.name, field.sw_access, field.bits_size, reg.var is not None, field.features)
+        for reg in registers for field in reg.fields
+    )
+    lock_field = next((field for reg in registers for field in reg.fields
+                       if 'LOCK_GEN' in field.features), None)
+    parity_fields = [(reg, field) for reg in registers for field in reg.fields
+                     if 'PARITY_GEN' in field.features]
+    if interrupt_groups or any(field.sw_access in EXTENDED_ACCESS for reg in registers for field in reg.fields):
+        generated_names = {members['EVENT'][0] + '_irq' for members in interrupt_groups.values()}
+        suffixes = {'EVENT': ('hw_set',), 'ONE_SHOT': ('hw_clr',),
+                    'CNT': ('hw_inc',), 'RCNT': ('hw_inc',),
+                    'RWW': ('hw_en', 'hw_val'), 'W1C': ('hw_en', 'hw_val'),
+                    'RC': ('hw_en', 'hw_val'), 'RCI': ('hw_clc',)}
+        for reg in registers:
+            for field in reg.fields:
+                generated_names.update(f'{field.name}_{suffix}' for suffix in suffixes.get(field.sw_access, ()))
+        collisions = generated_names & {field.name for reg in registers for field in reg.fields}
+        if collisions:
+            raise ValueError('Field name conflicts with generated interrupt/hardware signal(s): ' + ', '.join(sorted(collisions)))
+    if lock_field or parity_fields:
+        generated_names = {'autoreg_write_allowed'}
+        for _, field in parity_fields:
+            generated_names.update(f'{field.name}_{suffix}' for suffix in ('parity', 'next'))
+            generated_names.add(f'parity_err_{field.name}')
+        collisions = generated_names & {field.name for reg in registers for field in reg.fields}
+        if collisions:
+            raise ValueError('Field name conflicts with generated safety signal(s): ' + ', '.join(sorted(collisions)))
     ram_select_signal = " | ".join(f"{reg.fields[0].name}_sel" for reg in ram_regs)
     # Keep packed-array port names in one column even when their dimensions differ.
     packed_range_width = None
@@ -493,7 +689,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
         for reg in registers:
             if reg.var is not None and not is_ram_register(reg):
                 for field in reg.fields:
-                    if field.sw_access in ("RW", "WO", "W1P", "W1C", "RC", "RO"):
+                    if field.sw_access in SUPPORTED_ACCESS - RAM_ACCESS_TYPES:
                         if field.bits_size == 1:
                             packed_ranges.append(f"[{reg.var_val:02}:0]")
                         else:
@@ -543,29 +739,46 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                 code.append(f"output              {field.name}_en,")
                 if field.sw_access == RAM_RW_ACCESS:
                     code.append(f"output              {field.name}_we,")
-                code.append(f"output      [{ram_addr_width-1:02}:0]  {field.name}_addr,")
+                if ram_addr_width == 1:
+                    code.append(f"output              {field.name}_addr,")
+                else:
+                    code.append(f"output      [{ram_addr_width-1:02}:0]  {field.name}_addr,")
                 if field.sw_access == RAM_RW_ACCESS:
                     code.append(f"output      [{field.bits_size-1:02}:0]  {field.name}_wdata,")
                     code.append(f"output      [{field.bits_size-1:02}:0]  {field.name}_wmask,")
                 code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}_rdata,")
+                if table_pending:
+                    code.append(f"input               {field.name}_ready,")
                 continue
             for field in reg.fields:
+                if is_internal_field(field):
+                    continue
                 if field.sw_access in ("RW", "WO", "W1P"):
                     code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
-                elif field.sw_access in ("W1C", "RC"):
+                elif field.sw_access in ("W1C", "RC", "RWW"):
                     code.append(format_array_port("input", "", 1, f"{field.name}_hw_en", reg.var_val, pack_array, packed_range_width))
                     code.append(format_array_port("input", "", field.bits_size, f"{field.name}_hw_val", reg.var_val, pack_array, packed_range_width))
                     code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
+                elif field.sw_access in ('EVENT', 'ONE_SHOT', 'CNT', 'RCNT'):
+                    suffix = {'EVENT': 'hw_set', 'ONE_SHOT': 'hw_clr', 'CNT': 'hw_inc', 'RCNT': 'hw_inc'}[field.sw_access]
+                    hw_width = 1 if field.sw_access in ('CNT', 'RCNT') else field.bits_size
+                    code.append(format_array_port('input', '', hw_width, f'{field.name}_{suffix}', reg.var_val, pack_array, packed_range_width))
+                    code.append(format_array_port('output', 'reg', field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
+                elif field.sw_access == "RCI":
+                    code.append(format_array_port("output", "reg", 1, f"{field.name}_hw_clc", reg.var_val, pack_array, packed_range_width))
+                    code.append(format_array_port("input", "", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
                 elif field.sw_access == "RO":
                     code.append(format_array_port("input", "", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
         else:# Non-variable registers                        
             for field in reg.fields:
+                if is_internal_field(field):
+                    continue
                 if field.sw_access in ("RW", "WO", "W1P"): 
                     if field.bits_size == 1:
                         code.append(f"output reg          {field.name},")
                     else:
                         code.append(f"output reg  [{field.bits_size-1:02d}:0]  {field.name},")
-                elif field.sw_access in ("W1C", "RC"):
+                elif field.sw_access in ("W1C", "RC", "RWW"):
                     if field.bits_size == 1:
                         code.append(f"input               {field.name}_hw_en,")
                         code.append(f"input               {field.name}_hw_val,")
@@ -574,12 +787,33 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                         code.append(f"input               {field.name}_hw_en,")
                         code.append(f"input       [{field.bits_size-1:02}:0]  {field.name}_hw_val,")
                         code.append(f"output reg  [{field.bits_size-1:02}:0]  {field.name},")
-                elif field.sw_access == "RO":
+                elif field.sw_access in ('EVENT', 'ONE_SHOT', 'CNT', 'RCNT'):
+                    suffix = {'EVENT': 'hw_set', 'ONE_SHOT': 'hw_clr', 'CNT': 'hw_inc', 'RCNT': 'hw_inc'}[field.sw_access]
+                    width = f'[{field.bits_size-1:02}:0]' if field.bits_size > 1 else ''
+                    hw_width = '' if field.sw_access in ('CNT', 'RCNT') else width
+                    code.append(f'input       {hw_width:<6}  {field.name}_{suffix},')
+                    code.append(f'output reg  {width:<6}  {field.name},')
+                elif field.sw_access in ("RO", "RCI"):
+                    if field.sw_access == "RCI":
+                        code.append(f"output reg          {field.name}_hw_clc,")
                     if field.bits_size == 1:
                         code.append(f"input               {field.name},")
                     else:
                         code.append(f"input       [{field.bits_size-1:02}:0]  {field.name},")
     
+    for members in interrupt_groups.values():
+        event_name, _, depth = members['EVENT']
+        if depth is None:
+            code.append(f'output              {event_name}_irq,')
+        else:
+            code.append(format_array_port('output', '', 1, f'{event_name}_irq', depth - 1, pack_array, packed_range_width))
+
+    for reg, field in parity_fields:
+        if reg.var is not None:
+            code.append(format_array_port('output', 'reg', 1, f'parity_err_{field.name}', reg.var_val, pack_array, packed_range_width))
+        else:
+            code.append(f'output reg          parity_err_{field.name},')
+
     align_module_port_names(code)
     code[-1] = code[-1].rstrip(',')  # Remove last comma
     code.append(");\n")
@@ -592,6 +826,8 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
         code.append(f"wire [{_addr_width-1}:0]    reg_addr;")
         code.append("wire           wr_en;")
         code.append("wire           rd_en;")
+        if table_pending and has_ram:
+            code.append("wire           table_rd_en;")
         code.append("wire [3 :0]    wr_msk;")
         code.append("wire [31:0]    wr_data;")
         code.append("wire [31:0]    rd_data;" if has_ram else "reg  [31:0]    rd_data;")
@@ -601,10 +837,19 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
         code.append("assign reg_addr = paddr;")
         code.append("assign wr_en    = psel & penable & pwrite;")
         code.append("assign rd_en    = psel & ~penable & ~pwrite;")
+        if table_pending and has_ram:
+            code.append("assign table_rd_en = psel & ~pwrite;")
         code.append("assign wr_msk   = 4'b1111;")
         code.append("assign wr_data  = pwdata;")
         code.append("assign prdata   = rd_data;")
-        code.append("assign pready   = 1'b1;")
+        if table_pending and has_ram:
+            ready_terms = [
+                f"(~{reg.fields[0].name}_en | {reg.fields[0].name}_ready)"
+                for reg in ram_regs
+            ]
+            code.append(f"assign pready   = {' & '.join(ready_terms)};")
+        else:
+            code.append("assign pready   = 1'b1;")
         code.append("assign pslverr  = 1'b0;")
         code.append("")
     
@@ -616,15 +861,43 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     if has_ram:
         code.append("reg  [31:0]    normal_rd_data;")
     code.append("wire [31:0]    msk;")
+    if lock_field:
+        code.append(f'reg            {lock_field.name};')
+        code.append('wire           autoreg_write_allowed;')
+        lock_value = lock_field.name
+        if 'PARITY_GEN' in lock_field.features:
+            # Keep write protection immediate even though the error port is registered.
+            lock_value += f' & ~((^{lock_field.name}) ^ {lock_field.name}_parity)'
+    for reg in registers:
+        for field in reg.fields:
+            if field.int_group is not None and field.sw_access in {'RW', 'W1P'}:
+                if reg.var is not None:
+                    declaration = format_array_port('output', 'reg', field.bits_size, field.name, reg.var_val, pack_array, packed_range_width)
+                    code.append(declaration.replace('output reg', 'reg       ', 1).rstrip(',') + ';')
+                else:
+                    width = f'[{field.bits_size-1:02}:0]' if field.bits_size > 1 else ''
+                    code.append(f'reg  {width:<9} {field.name};')
+    for reg, field in parity_fields:
+        array = f'[{reg.var_val}:0]' if reg.var is not None else ''
+        width = f'[{field.bits_size - 1}:0] ' if field.bits_size > 1 else ''
+        code.append(f'reg            {field.name}_parity{array};')
+        code.append(f'{"wire " + width:<15}{field.name}_next{array};')
     for reg in ram_regs:
         field = reg.fields[0]
+        if is_wide_register(reg):
+            emit_wide_ram_declarations(code, reg, _addr_width, table_pending)
+            continue
         code.append(f"wire           {field.name}_sel;")
-        code.append(f"reg            {field.name}_sel_d;")
+        if not table_pending:
+            code.append(f"reg            {field.name}_sel_d;")
         code.append(f"wire [31:0]    {field.name}_rdata_final;")
     
     # Address decode wires
     for reg in registers:
         if is_ram_register(reg):
+            continue
+        if is_wide_register(reg):
+            emit_wide_declarations(code, reg)
             continue
         if reg.var is not None:    
             if reg.wr == 'r':
@@ -641,6 +914,12 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     code.append("//main code")
     code.append("//============================================================================")
     code.append("assign msk = {{8{wr_msk[3]}},{8{wr_msk[2]}},{8{wr_msk[1]}},{8{wr_msk[0]}}};\n")
+    if lock_field:
+        code.append('//============================================================================')
+        code.append('// Global software write permission (LOCK_GEN)')
+        code.append('//============================================================================')
+        code.append(f'assign autoreg_write_allowed = {lock_value};')
+        code.append('')
     
     # Address decoding
     code.append("//============================================================================")
@@ -652,6 +931,11 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     # Calculate the maximum length of the left-hand side expressions
     max_lhs_length = 0
     for reg in registers:
+        if is_wide_register(reg):
+            if not is_ram_register(reg) and reg.wr == 'w':
+                suffix = '[i]' if reg.var is not None else ''
+                max_lhs_length = max(max_lhs_length, len(f'wr_en_{reg.reg_name}_{word_count(reg)-1}{suffix}'))
+            continue
         if reg.wr == 'w':
             if reg.var is not None:
                 lhs_length = len(f"wr_en_{reg.reg_name}[{reg.var_val:02}]")
@@ -663,6 +947,13 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
 
     # Generate the Verilog code with aligned assign statements
     for reg in registers:
+        if is_wide_register(reg):
+            if not is_ram_register(reg):
+                if reg.var is not None and reg.wr == 'w' and not gvar_i_declared:
+                    code.append('\ngenvar i;')
+                    gvar_i_declared = True
+                emit_wide_decode(code, reg, _addr_width, max_lhs_length)
+            continue
         if reg.wr == 'w':
             if reg.var is not None:
                 if not gvar_i_declared:
@@ -679,6 +970,26 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     
 
 
+    if interrupt_groups:
+        code.append('\n//============================================================================')
+        code.append('// Interrupt outputs (mask bit 1 disables the corresponding source)')
+        code.append('//============================================================================')
+        irq_name_width = max(len(members['EVENT'][0] + '_irq') for members in interrupt_groups.values())
+        for members in interrupt_groups.values():
+            event_name, _, depth = members['EVENT']
+            mask_name = members['RW'][0]
+            if depth is None:
+                code.append(f'assign {event_name + "_irq":<{irq_name_width}} = |({event_name} & ~{mask_name});')
+            else:
+                if not gvar_i_declared:
+                    code.append('\ngenvar i;')
+                    gvar_i_declared = True
+                code.append('generate')
+                code.append(f'    for(i = 0; i < {depth}; i = i + 1) begin: irq_gen_{event_name}')
+                code.append(f'        assign {event_name}_irq[i] = |({event_name}[i] & ~{mask_name}[i]);')
+                code.append('    end')
+                code.append('endgenerate')
+
     # Register writes
     code.append("\n//============================================================================")
     code.append(  "// reg write")
@@ -686,12 +997,71 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     for reg in registers:
         if is_ram_register(reg):
             continue
+        if is_wide_register(reg):
+            if reg.var is not None and not gvar_i_declared:
+                code.append('\ngenvar i;')
+                gvar_i_declared = True
+            emit_wide_storage(code, reg, _addr_width, lock_field is not None)
+            if reg.var is not None:
+                if not ginter_j_declared:
+                    code.append('integer j;')
+                    ginter_j_declared = True
+                emit_wide_array_read(code, reg, _addr_width, pack_array)
+            continue
+        for field in reg.fields:
+            if field.sw_access in EXTENDED_ACCESS:
+                if reg.var is not None and not gvar_i_declared:
+                    code.append('\ngenvar i;')
+                    gvar_i_declared = True
+                emit_extended_storage(code, reg, field, _addr_width, lock_field is not None,
+                                      interrupt_tests.get(field.name))
+            if 'PARITY_GEN' in field.features:
+                if reg.var is not None and not gvar_i_declared:
+                    code.append('\ngenvar i;')
+                    gvar_i_declared = True
+                emit_parity_storage(code, reg, field, lock_field is not None)
+        # External read-clear fields only store a registered clear indication.
+        # Read data is captured on the same edge from the external field input.
+        for field in reg.fields:
+            if field.sw_access != "RCI":
+                continue
+            code.append("//============================================================================")
+            code.append(f"// {field.name} external read-clear indication")
+            code.append("//============================================================================")
+            if reg.var is not None:
+                if not gvar_i_declared:
+                    code.append("\ngenvar i;")
+                    gvar_i_declared = True
+                code.append("generate")
+                code.append(f"    for(i = 0; i <= {reg.var_val}; i = i + 1) begin: rd_clc_field_{field.name}")
+                target = f"{field.name}_hw_clc[i]"
+                address = f"{_addr_width}'h{reg.offset} + {_addr_width}'h{reg.var_step} * i"
+                indent = "        "
+            else:
+                target = f"{field.name}_hw_clc"
+                address = f"{_addr_width}'h{reg.offset}"
+                indent = ""
+            code.append(f"{indent}always @(posedge clk or negedge rst_n) begin")
+            code.append(f"{indent}    if (!rst_n)")
+            code.append(f"{indent}        {target} <= 1'b0;")
+            code.append(f"{indent}    else")
+            code.append(f"{indent}        {target} <= rd_en && (reg_addr[{_addr_width-1}:0] == {address});")
+            code.append(f"{indent}end")
+            if reg.var is not None:
+                code.append("    end")
+                code.append("endgenerate")
+            code.append("")
         if reg.var is not None:# Variable registers
             if reg.wr == 'w' or any(field.sw_access == "RC" for field in reg.fields):
                 if not gvar_i_declared:
                     code.append("\ngenvar i;")
                     gvar_i_declared = True
                 for field in reg.fields:
+                    field_wr_en = f'wr_en_{reg.reg_name}[i]'
+                    if lock_field and 'LOCK_GEN' not in field.features:
+                        field_wr_en = f'({field_wr_en} & autoreg_write_allowed)'
+                    if 'PARITY_GEN' in field.features:
+                        continue
                     if field.sw_access not in ("RW", "WO", "W1P", "W1C", "RC"):
                         continue
                     code.append( "//============================================================================")
@@ -704,18 +1074,20 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                     code.append(f"                {field.name}[i] <= {field.default};")
                     code.append(f"            else begin")
                     if field.sw_access in ("RW", "WO"):
-                        code.append(f"                if (wr_en_{reg.reg_name}[i] == 1'b1)")
+                        code.append(f"                if ({field_wr_en} == 1'b1)")
                         if field.bits_size == 1:
                             code.append(f"                    {field.name}[i] <= ({field.name}[i] & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
                         else:
                             code.append(f"                    {field.name}[i][{field.bits_size-1}:0] <= ({field.name}[i][{field.bits_size-1}:0] & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
                     elif field.sw_access == "W1P":
-                        code.append(f"                if (wr_en_{reg.reg_name}[i] == 1'b1)")
+                        code.append(f"                if ({field_wr_en} == 1'b1)")
                         code.append(f"                    {field.name}[i] <= wr_data[{field.bits}] & msk[{field.bits}];")
+                        code.append("                else")
+                        code.append(f"                    {field.name}[i] <= {field.bits_size}'h0;")
                     elif field.sw_access == "W1C":
                         code.append(f"                if ({field.name}_hw_en[i] == 1'b1)")
                         code.append(f"                    {field.name}[i] <= {field.name}_hw_val[i];")
-                        code.append(f"                else if (wr_en_{reg.reg_name}[i] == 1'b1)")
+                        code.append(f"                else if ({field_wr_en} == 1'b1)")
                         code.append(f"                    {field.name}[i] <= (~wr_data[{field.bits}] | ~msk[{field.bits}]) & {field.name}[i];")
                     elif field.sw_access == "RC":
                         code.append(f"                if ({field.name}_hw_en[i] == 1'b1)")
@@ -738,9 +1110,9 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
             code.append(f"    for(j = 0; j <= {reg.var_val}; j = j + 1) begin:rdata_loop_{reg.reg_name}")
             code.append(f"        if (reg_addr[{_addr_width-1}:0] == {_addr_width}'h{reg.offset} + {_addr_width}'h{reg.var_step} * j) begin")
             for field in reg.fields:
-                if field.sw_access == "WO":
+                if field.sw_access in ("WO", "W1P"):
                     continue
-                if field.bits_size == 1:
+                if field.bits_size == 1 or field.sw_access == "RCI" or pack_array:
                     code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j];")
                 else:
                     code.append(f"            rd_data_nxt_{reg.reg_name}[{field.bits}] = {field.name}[j][{field.bits_size - 1}:0];")
@@ -749,7 +1121,12 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
             code.append("end\n")    
         else:# Non-variable registers                  
             for field in reg.fields:
-                if field.sw_access != "RO": 
+                field_wr_en = f'wr_en_{reg.reg_name}'
+                if lock_field and 'LOCK_GEN' not in field.features:
+                    field_wr_en = f'({field_wr_en} & autoreg_write_allowed)'
+                if 'PARITY_GEN' in field.features or field.sw_access in EXTENDED_ACCESS:
+                    continue
+                if field.sw_access not in ("RO", "RCI"):
                     code.append( "//============================================================================")
                     code.append(f"// {field.name} addr:{_addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] default:{field.default}")
                     code.append("//============================================================================")
@@ -761,20 +1138,20 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
                         code.append(f"        {field.name}[{field.bits_size-1}:0] <= {field.default};")
                     code.append("    else begin")
                     if field.sw_access in ("RW", "WO"):
-                        code.append(f"        if (wr_en_{reg.reg_name} == 1'b1)")
+                        code.append(f"        if ({field_wr_en} == 1'b1)")
                         if field.bits_size == 1:
                             code.append(f"            {field.name} <= ({field.name} & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
                         else:
                             code.append(f"            {field.name}[{field.bits_size-1}:0] <= ({field.name}[{field.bits_size-1}:0] & ~msk[{field.bits}]) | (wr_data[{field.bits}] & msk[{field.bits}]);")
                     elif field.sw_access == "W1P":
-                        code.append(f"        if (wr_en_{reg.reg_name} == 1'b1)")
+                        code.append(f"        if ({field_wr_en} == 1'b1)")
                         code.append(f"            {field.name} <= wr_data[{field.bits}] & msk[{field.bits}];")
                         code.append("        else")
-                        code.append(f"            {field.name} <= 1'b0;")
+                        code.append(f"            {field.name} <= {field.bits_size}'h0;")
                     elif field.sw_access == "W1C":
                         code.append(f"        if ({field.name}_hw_en == 1'b1)")
                         code.append(f"            {field.name} <= {field.name}_hw_val;")
-                        code.append(f"        else if (wr_en_{reg.reg_name} == 1'b1)")
+                        code.append(f"        else if ({field_wr_en} == 1'b1)")
                         code.append(f"            {field.name} <= (~wr_data[{field.bits}] | ~msk[{field.bits}]) & {field.name};")
                     
                     elif field.sw_access == "RC":
@@ -790,6 +1167,9 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     # RAM table interfaces
     #============================================================================
     for reg in ram_regs:
+        if is_wide_register(reg):
+            emit_wide_ram(code, reg, _addr_width, table_pending, lock_field is not None)
+            continue
         field = reg.fields[0]
         ram_addr_width = max(1, reg.var_val.bit_length())
         ram_step = int(reg.var_step, 16)
@@ -803,9 +1183,17 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
             f"(reg_addr <= {_addr_width}'h{reg.offset} + {reg.var_val} * {_addr_width}'h{reg.var_step}) && "
             f"(((reg_addr - {_addr_width}'h{reg.offset}) & {_addr_width}'h{ram_step_mask:x}) == {_addr_width}'h0);"
         )
-        if field.sw_access == RAM_RW_ACCESS:
-            code.append(f"assign {field.name}_en    = {field.name}_sel  & (wr_en | rd_en);")
-            code.append(f"assign {field.name}_we    = {field.name}_sel  & wr_en;")
+        ram_wr_en = '(wr_en & autoreg_write_allowed)' if lock_field else 'wr_en'
+        if table_pending:
+            request = f"{field.name}_sel & table_rd_en"
+            if field.sw_access == RAM_RW_ACCESS:
+                request = f"{field.name}_sel & (table_rd_en | {ram_wr_en})"
+            code.append(f"assign {field.name}_en    = {request};")
+            if field.sw_access == RAM_RW_ACCESS:
+                code.append(f"assign {field.name}_we    = {field.name}_sel & {ram_wr_en};")
+        elif field.sw_access == RAM_RW_ACCESS:
+            code.append(f"assign {field.name}_en    = {field.name}_sel  & ({ram_wr_en} | rd_en);")
+            code.append(f"assign {field.name}_we    = {field.name}_sel  & {ram_wr_en};")
         else:
             code.append(f"assign {field.name}_en    = {field.name}_sel  & rd_en;")
         code.append(f"assign {field.name}_addr  = (reg_addr - {_addr_width}'h{reg.offset}) >> {ram_step.bit_length() - 1};")
@@ -813,18 +1201,26 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
             code.append(f"assign {field.name}_wdata = wr_data[{field.bits_size-1}:0];")
             code.append(f"assign {field.name}_wmask = msk[{field.bits_size-1}:0];")
         code.append("")
-        code.append("always @(posedge clk or negedge rst_n) begin")
-        code.append("    if (!rst_n)")
-        code.append(f"        {field.name}_sel_d <= 1'b0;")
-        code.append("    else")
-        code.append(f"        {field.name}_sel_d <= rd_en & {field.name}_sel;")
-        code.append("end")
+        if not table_pending:
+            code.append("always @(posedge clk or negedge rst_n) begin")
+            code.append("    if (!rst_n)")
+            code.append(f"        {field.name}_sel_d <= 1'b0;")
+            code.append("    else")
+            code.append(f"        {field.name}_sel_d <= rd_en & {field.name}_sel;")
+            code.append("end")
         if field.bits_size == 32:
             rdata_expr = f"{field.name}_rdata[31:0]"
         else:
             zero_extend = f"{{{32 - field.bits_size}{{1'b0}}}}"
             rdata_expr = f"{{{zero_extend}, {field.name}_rdata[{field.bits_size-1}:0]}}"
-        code.append(f"assign {field.name}_rdata_final = ({{32{{{field.name}_sel_d}}}} & {rdata_expr});")
+        if table_pending:
+            read_select = f"{field.name}_en"
+            if field.sw_access == RAM_RW_ACCESS:
+                read_select += " & ~pwrite"
+        else:
+            read_select = f"{field.name}_sel_d"
+        read_mask = '{32{' + read_select + '}}'
+        code.append(f"assign {field.name}_rdata_final = ({read_mask} & {rdata_expr});")
         code.append("")
     # Read data logic
     code.append("//============================================================================")
@@ -836,6 +1232,9 @@ def generate_verilog(module_info, registers, filename, pack_array=False):
     
     for reg in registers:
         if reg.var is None:
+            if is_wide_register(reg):
+                emit_wide_read_cases(code, reg, _addr_width)
+                continue
             addr = reg.offset
             code.append(f"    {_addr_width}'h{addr}: begin")
             for field in reg.fields:
@@ -905,10 +1304,13 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output', help='Output path or file. Can be a directory path (generates module_name.v) or complete file path')
     parser.add_argument('-p', '--parallel', action='store_true', help='Enable parrllel implement for loop. Default by array implement')
     parser.add_argument('--pack_array', action='store_true', help='Generate variable-register ports as packed arrays')
+    parser.add_argument('--table_pending', action='store_true', help='Use RAM table ready handshakes (APB only)')
     args = parser.parse_args()
 
     try:
         module_info, registers = parse_excel(args.input, parallel=args.parallel)
+        if args.table_pending and module_info['cfg_interface'] != 'apb':
+            raise ValueError('--table_pending requires an APB configuration interface')
     except (ValueError, OSError) as error:
         print(f'\033[31mError: {error}\033[0m', file=sys.stderr)
         sys.exit(1)
@@ -934,7 +1336,7 @@ if __name__ == "__main__":
         # Default: generate in current directory
         output_file = f"{module_info['module']}.v"
     
-    verilog_code = generate_verilog(module_info, registers, os.path.basename(output_file).split('.')[0], pack_array=args.pack_array)
+    verilog_code = generate_verilog(module_info, registers, os.path.basename(output_file).split('.')[0], pack_array=args.pack_array, table_pending=args.table_pending)
     with open(output_file, 'w') as f:
         f.write(verilog_code)
     print(f"Successfully generated {output_file}")
