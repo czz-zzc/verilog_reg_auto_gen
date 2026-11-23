@@ -13,7 +13,7 @@ import os
 import sys
 from register_features import (SOFTWARE_WRITABLE, SUPPORTED_ACCESS, normalize_access,
                                parse_info_features, parse_interrupt_group,
-                               validate_feature_specs, validate_interrupt_specs)
+                               validate_feature_specs, validate_interrupt_specs, validate_version_specs)
 from wide_registers import (WIDE_ACCESS, is_wide_register, word_count,
                             emit_wide_declarations, emit_wide_decode, emit_wide_storage,
                             emit_wide_read_cases, emit_wide_array_read,
@@ -469,6 +469,10 @@ def parse_excel(filename, parallel=False, module_name_override=None):
         finalize_register(current_reg)
 
     validate_register_addresses(registers, module_size=module_size, addr_width=addr_width)
+    validate_version_specs(
+        (field.name, field.sw_access, field.bits, reg.var is not None)
+        for reg in registers for field in reg.fields
+    )
     validate_feature_specs(
         (field.name, field.sw_access, field.bits_size, reg.var is not None, field.features)
         for reg in registers for field in reg.fields
@@ -524,6 +528,7 @@ def collect_interrupt_groups(registers):
 
 def is_internal_field(field):
     return ('LOCK_GEN' in field.features or
+            (field.name == 'reg_version' and field.sw_access == 'RO') or
             (field.int_group is not None and field.sw_access in {'RW', 'W1P'}))
 
 
@@ -1240,6 +1245,8 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
             for field in reg.fields:
                 if field.sw_access in ("WO", "W1P"):
                     code.append(f"        rd_data_nxt[{field.bits}] = {field.bits_size}'h0;")
+                elif field.name == 'reg_version' and field.sw_access == 'RO':
+                    code.append(f"        rd_data_nxt[{field.bits}] = {field.default};")
                 else:
                     if field.bits_size == 1:
                         code.append(f"        rd_data_nxt[{field.bits}] = {field.name};")

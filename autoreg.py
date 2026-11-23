@@ -11,6 +11,7 @@ sys.dont_write_bytecode = True
 
 from convert_excel import parse_new_format, write_b_format
 from gen_reg import generate_verilog, parse_excel
+from register_versions import prepare_version_update, save_version_update
 
 
 def intermediate_excel_path(input_file, output_file):
@@ -75,6 +76,7 @@ def main():
     intermediate_file = None
     try:
         module_info, registers = parse_new_format(args.input, bus_type=args.bus_type)
+        version_update = prepare_version_update(registers)
         output_file = resolve_verilog_path(args.output, module_info['module'])
         intermediate_file = intermediate_excel_path(args.input, output_file)
         intermediate_dir = os.path.dirname(intermediate_file)
@@ -96,7 +98,10 @@ def main():
         with open(verilog_file, 'w', encoding='utf-8') as file:
             file.write(verilog_code)
         check_verilog(verilog_file, b_module_info['module'], pack_array=args.pack_array)
+        if version_update is not None:
+            save_version_update(args.input, version_update)
         print(f'Successfully generated {verilog_file}')
+        print('\033[31mReminder: promptly commit the generated RTL code and Excel register table to SVN or Git.\033[0m')
     except (ValueError, OSError) as error:
         print(f'\033[31mError: {error}\033[0m', file=sys.stderr)
         if intermediate_file and os.path.exists(intermediate_file):

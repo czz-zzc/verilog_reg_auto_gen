@@ -12,7 +12,7 @@ import re
 import openpyxl
 from register_features import (SUPPORTED_ACCESS, info_feature_text, normalize_access, parse_info_features,
                                parse_interrupt_group, validate_feature_specs,
-                               validate_interrupt_specs)
+                               validate_interrupt_specs, validate_version_specs)
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
@@ -305,6 +305,7 @@ def parse_new_format(filename, bus_type='apb'):
             field_description = cell_value(row, columns, 'field_description')
             description = field_description if field_description not in (None, '') else current_reg['reg_description']
             current_reg['fields'].append({
+                'source_row': row_number,
                 'bits': str(bits).strip(),
                 'field': str(field_name).strip(),
                 'sw_access': sw_access,
@@ -322,6 +323,10 @@ def parse_new_format(filename, bus_type='apb'):
         if not reg['fields']:
             raise ValueError(f"Register {reg['reg_name']!r} has no fields")
 
+    validate_version_specs(
+        (field['field'], field['sw_access'], field['bits'], reg['repeat'] is not None)
+        for reg in registers for field in reg['fields']
+    )
     validate_feature_specs(
         (field['field'], field['sw_access'], calculate_bit_width(field['bits']),
          reg['repeat'] is not None, parse_info_features(field.get('info')))
