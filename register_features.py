@@ -3,17 +3,25 @@
 import re
 
 
-SOFTWARE_WRITABLE = {'RW', 'WO', 'W1P', 'W1C', 'EVENT', 'ONE_SHOT', 'RWW', 'CNT', 'RCNT'}
+SOFTWARE_WRITABLE = {'RW', 'WO', 'W1P', 'EVENT', 'ONE_SHOT', 'RWW', 'CNT', 'RCNT'}
 SUPPORTED_ACCESS = SOFTWARE_WRITABLE | {'RO', 'RC', 'RCI', 'RAM_RW', 'RAM_RO'}
-INT_MARKER = re.compile(r'(?:^|[;,\s])int:', re.IGNORECASE)
+VERSION_FIELD_BITS = {'rtl_version': '31:8', 'reg_version': '7:0'}
+INFO_SEPARATORS = r';,；，\s'
+INFO_BOUNDARY = rf'(?<![^{INFO_SEPARATORS}])'
+INFO_GROUP = rf'[^{INFO_SEPARATORS}]*'
+INT_MARKER = re.compile(INFO_BOUNDARY + r'int:', re.IGNORECASE)
+COMB_MARKER = re.compile(rf'{INFO_BOUNDARY}comb:({INFO_GROUP})', re.IGNORECASE)
+INFO_QUOTE_OR_INT = re.compile(
+    r'''(?P<quoted>(?<![A-Za-z0-9_])(?:"[^"]*"|'[^']*'|“[^”]*”|‘[^’]*’))'''
+    + rf'|{INT_MARKER.pattern}(?P<interrupt>{INFO_GROUP})', re.IGNORECASE,
+)
 
 
 def normalize_access(value):
     """Use the same access aliases in both Excel formats."""
     access = str(value or '').strip().upper()
-    access = {'R/W': 'RW', 'R/O': 'RO', 'R/C': 'RC', 'R/W/W': 'RWW'}.get(access, access)
-    if access in {'PULSE', 'W1S'}:
-        return 'W1P'
+    access = {'R/W': 'RW', 'R/O': 'RO', 'R/C': 'RC', 'R/W/W': 'RWW',
+              'PULSE': 'W1P', 'W1C': 'EVENT'}.get(access, access)
     if re.fullmatch(r'ONE[-_\s]SHOT', access):
         return 'ONE_SHOT'
     return access
@@ -21,28 +29,51 @@ def normalize_access(value):
 
 def validate_version_specs(specs):
     """Validate reserved version fields: (name, access, bits, is_array)."""
-    expected_bits = {'rtl_version': '31:8', 'reg_version': '7:0'}
     seen = set()
     for name, access, bits, is_array in specs:
-        if name not in expected_bits:
+        if name not in VERSION_FIELD_BITS:
             continue
         if name in seen:
             raise ValueError(f'Duplicate version field {name!r}')
         seen.add(name)
-        if access != 'RO' or re.sub(r'\s+', '', str(bits)) != expected_bits[name] or is_array:
-            raise ValueError(f"Version field {name!r} must be a scalar RO field with bits [{expected_bits[name]}]")
+        if access != 'RO' or re.sub(r'\s+', '', str(bits)) != VERSION_FIELD_BITS[name] or is_array:
+            raise ValueError(f"Version field {name!r} must be a scalar RO field with bits [{VERSION_FIELD_BITS[name]}]")
+
+
+def split_info(value):
+    """Separate feature text from opaque interrupt names, honoring paired quotes."""
+    text = str(value or '')
+    features = []
+    groups = []
+    end = 0
+    for item in INFO_QUOTE_OR_INT.finditer(text):
+        features.append(text[end:item.start()])
+        end = item.end()
+        if item.lastgroup == 'interrupt':
+            groups.append(item['interrupt'])
+            continue
+
+        quoted = item['quoted'][1:-1]
+        marker = INT_MARKER.search(quoted)
+        if marker is None:
+            features.append(quoted)
+        else:
+            features.append(quoted[:marker.start()])
+            groups.append(quoted[marker.end():].strip())
+    features.append(text[end:])
+    return ' '.join(features), groups
 
 
 def parse_interrupt_group(value):
-    """The int: marker consumes the rest of Info, preserving arbitrary group names."""
-    text = str(value or '')
-    marker = INT_MARKER.search(text)
-    if marker is None:
+    """Read one interrupt group; quote names containing separators."""
+    _, groups = split_info(value)
+    if not groups:
         return None
-    group = text[marker.end():].strip()
-    if not group:
+    if len(groups) != 1:
+        raise ValueError('Info allows one int:<group> marker per field')
+    if not groups[0]:
         raise ValueError('Interrupt marker int: requires a non-empty group name')
-    return group
+    return groups[0]
 
 
 def validate_interrupt_specs(specs):
@@ -52,7 +83,7 @@ def validate_interrupt_specs(specs):
         if group is None:
             continue
         if access not in {'EVENT', 'W1P', 'RW'}:
-            raise ValueError(f'Interrupt group {group!r}: field {name!r} must use EVENT, W1P/W1S or RW')
+            raise ValueError(f'Interrupt group {group!r}: field {name!r} must use EVENT, W1P or RW')
         if 'LOCK_GEN' in features:
             raise ValueError(f'Interrupt group {group!r}: field {name!r} cannot also use LOCK_GEN')
         members = groups.setdefault((group, index), {})
@@ -72,7 +103,17 @@ def validate_interrupt_specs(specs):
 
 def info_feature_text(value):
     """Exclude the opaque interrupt group name from other feature matching."""
-    return INT_MARKER.split(str(value or ''), maxsplit=1)[0]
+    return split_info(value)[0]
+
+
+def parse_comb_group(value):
+    """Read a named wide-field group from the feature portion of Info."""
+    groups = COMB_MARKER.findall(info_feature_text(value))
+    if not groups:
+        return None
+    if len(groups) != 1 or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', groups[0]):
+        raise ValueError('Info requires one comb:<Verilog identifier> marker per field')
+    return groups[0]
 
 
 def parse_info_features(value):

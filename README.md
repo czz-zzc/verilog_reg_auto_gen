@@ -1,164 +1,221 @@
-# Verilog 寄存器自动生成工具
+# Verilog 寄存器生成工具
 
-`gen_reg.py` 根据 Excel 寄存器描述生成 Verilog 寄存器模块，支持普通寄存器、数组寄存器及外部 RAM 表项，并可直接生成 regbus 或 APB 配置接口。
+根据 Excel 寄存器描述生成使用 32 位总线的寄存器模块，支持 APB、regbus、寄存器数组、外部 RAM 接口及大位宽分段访问。
 
-## 使用方法
+## 快速开始
 
-```sh
-python gen_reg.py <输入Excel文件> [-o <输出Verilog文件或目录>] [-p]
-```
-
-- `<输入Excel文件>`：寄存器描述 Excel 文件。
-- `-o`：输出 Verilog 文件路径；未指定时使用 Excel 中的 `module` 名称。
-- `-p`：将普通数组寄存器展开为独立寄存器实现。`RAM_RW` 与 `RAM_RO` 保持 RAM 表项接口生成，并输出 Warning。
-- `--pack_array`：普通数组寄存器的顶层端口使用压缩数组形式生成，例如 `input [63:0][15:0] ltssm_time`；内部访问方式不变。
-
-示例：
-
-```sh
-python gen_reg.py sys_reg.xlsx -o sys_reg.v
-```
-
-## A 表格转换
-
-`convert_excel.py` 用于把 A 表格转换为本工具使用的 B 表格：
-
-```sh
-python convert_excel.py <A表格.xlsx> -o <B表格.xlsx> --bus_type apb
-python gen_reg.py <B表格.xlsx> -o <输出Verilog文件>
-```
-
-- A 表格的 `Offset Addr` 已按 byte 地址处理，转换时不会乘 4。
-- A 表格的 `Entry` 映射到 B 表格的 `repeat`，格式为 `<数量>*<byte步进>`。
-- `Entry` 的数量可为常数或变量；变量范围从第二张 `variables` sheet 读取。范围 `0-N` 转换为数量 `N+1`。
-- `Attribute` 直接映射 `RW/WO/RO/W1P/W1C/RC/RAM_RW/RAM_RO`；`pulse` 映射为 `W1P`。
-- 通过 `--bus_type apb` 或 `--bus_type regbus` 指定 B 表格的 `cfg_interface`，默认 `apb`。
-
-## 一键生成
-
-`autoreg.py` 用于从 A 表格直接生成 Verilog，内部依次调用转换和生成流程：
-
-```sh
-python autoreg.py <A表格.xlsx> -o <输出Verilog文件> --bus_type apb
-```
-
-- `--bus_type`：选择 `apb` 或 `regbus`，默认 `apb`。
-- `-p`：传递给 `gen_reg.py`，展开普通数组寄存器。
-- `--keep_excel`：保留输出目录中的中间 B 表格 `mid.xlsx`；未指定时，成功生成 Verilog 后自动删除。
-- `--pack_array`：普通数组寄存器端口使用压缩数组形式，便于适配部分 SystemVerilog 工具；由于部分 Icarus Verilog 版本对多维 packed 端口支持不稳定，`autoreg.py` 会跳过 Icarus 自检并输出 Warning。
-- 指定 Verilog 文件时，模块名使用输出文件名（如 `-o sys_reg.v` 生成 `module sys_reg`）。
-- 转换或生成失败时，中间 B 表格会保留，便于定位问题。
-
-## Excel 格式
-
-寄存器描述位于第一张 sheet。脚本会通过 `offset` 表头定位寄存器表，因此寄存器表各列可以调整顺序。
-
-### 模块信息
-
-寄存器表之前填写模块信息。支持的项目包括：
-
-| 名称 | 说明 |
-| --- | --- |
-| `module` | 生成的模块名 |
-| `owner` | 文件头作者信息 |
-| `size` | 地址空间大小，例如 `4KB` |
-| `base_addr` | 文件头展示的基地址 |
-| `addr_width` | 配置地址宽度 |
-| `cfg_interface` | `regbus` 或 `apb`，默认为 `regbus` |
-
-### 寄存器表
-
-至少需要以下表头：`offset`、`repeat`、`reg_name`、`bits`、`field`、`sw_access`、`default`。
-
-- `offset` 仅填写十六进制基地址，例如 `0x100`；不再在该列填写数组变量或步进。
-- 标量寄存器的 `repeat` 留空。
-- 数组寄存器的 `repeat` 使用 `<数量>*<地址步进>`，例如 `64*0x8` 表示地址为 `0x100`、共 64 项、每项相隔 8 字节，实例下标为 `0` 到 `63`。
-- 填写 `repeat` 时必须使用上述格式；未填写时按单个寄存器处理。
-- field 名称全局唯一；同一寄存器内的 bit 段不可重叠。
-
-生成前会检查每个数组元素的实际地址：地址必须 4 字节对齐、位于模块地址空间和 `addr_width` 范围内，并且不能与其他寄存器或 RAM 表项重叠。
-
-## 配置接口
-
-### regbus
-
-`cfg_interface=regbus` 时，顶层直接提供：
-
-```verilog
-clk, rst_n, reg_addr, wr_en, rd_en, wr_msk, wr_data, rd_data
-```
-
-### APB
-
-`cfg_interface=apb` 时，顶层直接提供 APB 从设备接口：
-
-```verilog
-pclk, presetn, psel, penable, pwrite, paddr, pwdata, prdata, pready
-```
-
-生成模块内部直接完成 APB 到寄存器总线的转换，不会实例化额外的适配模块：
-
-```verilog
-wr_en  = psel & penable & pwrite;
-rd_en  = psel & ~penable & ~pwrite;
-wr_msk = 4'b1111;
-pready = 1'b1;
-```
-
-## 支持的访问类型
-
-| 类型 | 行为 |
-| --- | --- |
-| `RW` | 软件可读写，写入遵循字节写掩码。 |
-| `RO` | 软件只读，数据由模块外部输入。 |
-| `WO` | 软件只写，写入逻辑与 `RW` 相同；读取返回 `0`。 |
-| `W1P` | 软件写入 `1` 时产生一个时钟周期的脉冲；读取返回 `0`。 |
-| `W1C` | 软件写入 `1` 清除对应位；硬件通过 `<field>_hw_en/_hw_val` 更新且优先级更高。 |
-| `RC` | 软件读取当前值后清零；硬件通过 `<field>_hw_en/_hw_val` 更新且优先级更高。 |
-| `RAM_RW` | 外部单端口读写 RAM 表项。 |
-| `RAM_RO` | 外部只读 RAM 表项。 |
-
-### RAM 表项
-
-`RAM_RW` 与 `RAM_RO` 都必须满足：仅一个 field、`offset` 为表基地址、`repeat` 使用 `<数量>*<地址步进>` 定义表深度与步进，且地址步进为正的 2 的幂。默认值可以留空。
-
-`<table>_sel` 为生成模块内部信号，不会出现在顶层端口。
-
-`RAM_RW` 顶层接口包含：
-
-```verilog
-output              <table>_en,
-output              <table>_we,
-output       [A:0]  <table>_addr,
-output       [W:0]  <table>_wdata,
-output       [W:0]  <table>_wmask,
-input        [W:0]  <table>_rdata
-```
-
-`RAM_RO` 顶层接口仅包含：
-
-```verilog
-output              <table>_en,
-output       [A:0]  <table>_addr,
-input        [W:0]  <table>_rdata
-```
-
-两类表项读取均为一拍延迟：读请求有效时输出地址，外部 RAM 在下一拍提供对应 `rdata`，生成模块再将其合入 `rd_data/prdata`。
-
-## 依赖
+安装依赖：
 
 ```sh
 pip install openpyxl
 ```
 
-Python 标准库还使用 `argparse`、`re`、`datetime`、`os` 与 `sys`。
+生成 RTL：
 
-## 作者
+```sh
+python autoreg.py test_new.xlsx -o sys_reg.v
+```
 
-- Engineer：czz
-- 初始版本：2025-03-18
+默认使用 APB，输出 `sys_reg.v` 和同目录下的 `sys_reg_inst.vh`。若环境中已安装 Icarus Verilog，生成后自动执行编译检查，使用 `--pack_array` 时跳过该检查。
 
+### 顶层例化
 
+把下面一行放在上层 `module` 的端口列表之后，并将 `sys_reg.v` 加入编译。编译器通过 include 搜索路径找到 .vh 文件。
 
+```verilog
+`include "sys_reg_inst.vh"
+```
 
+`.vh` 会声明所有非总线端口对应的 `wire`，保留位宽及 packed/unpacked 数组维度，并生成 `sys_reg u_sys_reg` 的显式同名连接。APB 或 regbus 的信号（含时钟和复位）由上层提供，同样接入例化。上层负责驱动字段侧输入，例如 `rtl_version`、硬件置位信号和 RAM 读数据。
 
+每个上层模块内包含一次该文件。若同一上层需要多个实例或使用不同的总线信号名，可用生成的例化作为接线模板。独立调用 `gen_reg.py` 从 B 表生成 RTL 时，也会输出配套的 `_inst.vh`。
+
+## 命令参数
+
+```sh
+python autoreg.py <寄存器描述.xlsx> [-o <文件或目录>] [选项]
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `-o` | 输出文件或目录；省略时按表格中的模块名输出到当前目录。 |
+| `--bus_type apb\|regbus` | 配置总线类型，默认 `apb`。 |
+| `--name_type field\|reg_field` | 默认取字段名，`reg_field` 生成 `<寄存器名>_<字段名>`。也接受 `filed` 和 `reg_filed`。 |
+| `-p` | 将普通寄存器数组展开为独立寄存器和端口。 |
+| `--pack_array` | 普通数组端口使用 packed 格式，例如 `[63:0][15:0] field`。默认使用 unpacked 格式，例如 `[15:0] field [63:0]`。 |
+| `--table_pending` | 为 RAM 表增加完成握手，仅支持 APB。 |
+
+`-p` 和 `--pack_array` 不改变 RAM 表接口。
+
+例如 `Reg Name=CTRL`、`Field Name=en`，默认生成 `en`，使用以下命令生成 `CTRL_en`：
+
+```sh
+python autoreg.py test_new.xlsx -o sys_reg.v --name_type reg_field
+```
+
+两部分名称保留表中大小写。新名称用于 RTL 和例化头文件，RAM、硬件更新、中断和偶校验端口从新名称派生。普通数组用 `-p` 展开时仍在最前面加索引，例如 `i0_CTRL_en`。对于 `comb:`，使用最低地址行的寄存器名加组名。版本字段 `rtl_version`、`reg_version` 仍用固定名称。直接从 B 表生成时，`gen_reg.py` 同样接受这个参数。
+
+## Excel 描述规范
+
+完整填写规则和示例见 [寄存器 Excel 填写说明](FILLING_GUIDE.md)。
+
+### 模块信息
+
+在寄存器表上方填写，名称位于第一列，值位于右侧：
+
+| 名称 | 说明 |
+| --- | --- |
+| `Module` | 模块名；指定输出文件时，以文件名为准。 |
+| `ID` | 总线地址位宽，默认 `12`。 |
+| `Base Addr` | 基地址说明，默认 `32'h0000`；不参与地址译码。 |
+
+工作簿中应只有一张工作表包含 `Module` 信息及有效寄存器表。表头不区分大小写，各列顺序可调整。
+
+### 寄存器字段
+
+| 列名 | 说明 |
+| --- | --- |
+| `Reg Name` | 寄存器名称，每个寄存器的首行填写。 |
+| `Offset Addr` | 字节偏移地址，与 `Reg Name` 同行填写，支持十进制或 `0x` 十六进制。 |
+| `Entry` | 标量留空；数组填写 `<数量>*<字节步进>`，例如 `64*0x8`。 |
+| `Bits` | 普通字段范围为 `0`～`31`；大位宽字段填写 `W-1:0`，例如 `94:0`，规则见“大位宽分段访问”。 |
+| `Field Name` | 默认须全局唯一。使用 `reg_field` 时，可在不同寄存器复用字段名，生成的完整名称仍须唯一。 |
+| `Attribute` | 访问类型，见下表。留空按 `RW` 处理，`pulse` 等价于 `W1P`，`W1S` 字段跳过。 |
+| `Default Value` | 复位值，支持整数和 Verilog 数值；留空按零处理，`RCI` 不使用该值。 |
+| `Info` | 可选；支持 `NO_RTL_GEN`、`LOCK_GEN`、`PARITY_GEN`、`int:<组名>`、`comb:<组名>`，标记不区分大小写，组名区分大小写。 |
+| `Reg Description` / `Field Description` | 可选描述信息。 |
+
+同一寄存器的后续字段仅填写字段相关列。若全部字段均被忽略，则省略该寄存器。不支持的访问类型会触发警告并跳过整个寄存器。
+
+数组数量也可引用其他工作表中的变量。例如变量表的 `Name=CHANNEL`、`Range=0-7`，则 `Entry=CHANNEL*0x4` 表示 8 项、步进 4 字节。变量范围必须从零开始。
+
+寄存器及数组元素的地址必须 4 字节对齐、不重叠，且位于地址位宽及模块地址空间内；同一寄存器内的字段位段不得重叠。
+
+### Info 功能标记
+
+标记填写在字段行，可以用分号、逗号、空格或换行分隔。可用成对的单引号或双引号包住单个标记或一组标记，支持英文和中文引号，例如 `"LOCK_GEN"; 'PARITY_GEN'`。`NO_RTL_GEN` 在 A 表转换时按子串匹配，过滤后的字段不参与功能校验。
+
+| 标记 | 规则 |
+| --- | --- |
+| `LOCK_GEN` | 仅限标量、1 bit、RW 字段，每张有效寄存器工作表最多一个。字段仅在模块内部保存，不生成字段值输出端口，仍可经总线读写。 |
+| `PARITY_GEN` | 仅限 RW/WO 字段，独立保存一个偶校验位；支持标量、数组、`-p` 和 `--pack_array`。 |
+| `int:<组名>` | 将 EVENT、W1P、RW 字段关联为一个中断组。与其他标记用分号、逗号或空白分隔。 |
+| `comb:<组名>` | 将相邻地址上的分段字段识别为一个 `RW`、`RO`、`RAM_RW` 或 `RAM_RO` 宽字段。组名用作生成的字段名，填写示例见 [大位宽字段](FILLING_GUIDE.md#大位宽字段)。 |
+
+**写权限**：LOCK_GEN 值为 1 时允许其他软件写入，为 0 时忽略写入；LOCK_GEN 字段自身始终可写。同地址其他字段也受控。权限按本次写入前的值判断，新值用于后续事务。默认值由表格指定，不改变读取、读清零或硬件更新行为。软件可写的 RW、WO、W1P、EVENT、ONE_SHOT、RWW、CNT、RCNT 及 RAM_RW 都受控；被禁止的 APB 写入正常完成、不报总线错误，且不发起 RAM 请求、不等待 RAM ready。
+
+**校验与报警**：普通字段按最终写掩码合并值更新数据和校验位，无有效字段写掩码或写入被阻止时均保持；大位宽 RW 的校验随整条提交更新，见下文。每个字段生成 `output reg parity_err_<field>`，数组逐元素输出，错误端口统一放在模块端口列表末尾；时钟上升沿采样当前数据和校验位，不一致输出 1，一致输出 0，低有效异步复位清零。合法写入修复存储的同一时钟沿仍会报告更新前的错误，下一次采样一致后清零。模块不生成错误汇总或 sticky 状态，安全岛负责汇总、记录和响应。锁字段若同时标记 PARITY_GEN，隐藏字段值端口但仍输出专用 parity 错误端口；写保护直接检查当前锁数据与校验位，不等待错误端口的时序更新，自身始终可写以恢复。
+
+校验支持存储内容奇数位翻转检测，不纠错，偶数位同时翻转可能漏检，也不检测写入前已损坏的数据或未被时钟采样到的短暂故障。后续合法字段更新会重建校验，错误端口可能恢复；重建校验不代表纠正了未被覆盖的数据。安全岛需采样各字段错误端口并保存所需故障记录；检测功能不等同于安全等级认证。
+
+## 访问类型
+
+| 类型 | 行为 |
+| --- | --- |
+| `RW` / `R/W` | 软件可读写，支持字节写掩码。 |
+| `RO` / `R/O` | 软件只读，字段值由外部输入。 |
+| `WO` | 软件只写，读取返回零；生成 RTL 时输出带寄存器名和字段名的 Warning，仍正常生成。 |
+| `W1P` | 写入 1 产生一拍脉冲，读取返回零。也接受 `pulse`。 |
+| `EVENT` | 软件写 1 清零，逐位输入 `<field>_hw_set` 置位，同一位硬件置位优先，输出 `<field>`。旧表中的 `W1C` 按此类型生成。 |
+| `ONE_SHOT` | 软件写 1 置位；逐位输入 `<field>_hw_clr` 清零，同一位硬件清零优先；输出 `<field>`。也接受 `one-shot`、`one shot`。 |
+| `RWW` / `R/W/W` | 软件读写；1 bit 输入 `<field>_hw_en` 有效时以 `<field>_hw_val` 更新整个字段，硬件优先；输出 `<field>`。 |
+| `CNT` | 软件读写；1 bit 输入 `<field>_hw_inc` 每个有效时钟沿加 1，达到字段全 1 后保持；有效软件写优先；输出 `<field>`。 |
+| `RCNT` | 同 CNT，但计数溢出时回卷为 0。 |
+| `RC` / `R/C` | 读取后清零；外部通过 `<field>_hw_en/_hw_val` 更新，硬件更新优先。 |
+| `RCI` | 读取后清零；外部维护字段值，读取时输出 `<field>_hw_clc` 清零指示。 |
+| `RAM_RW` | 外部读写 RAM 表。 |
+| `RAM_RO` | 外部只读 RAM 表。 |
+
+A 表和 B 表都跳过 `W1S` 字段。同一寄存器的其他字段照常生成，全部字段都被过滤时省略整个寄存器。旧表中用 `W1S` 作中断测试的字段需改填 `W1P`。
+
+新增类型不区分大小写，支持标量、普通数组、`-p` 和 `--pack_array`。EVENT/ONE_SHOT 的硬件控制与字段等宽，软件写 0 保持对应位；RWW/CNT/RCNT 支持按字节掩码合并软件写入。CNT/RCNT 仅在字段内存在有效写掩码且写权限允许时优先接受软件写，否则仍可硬件计数；`hw_inc` 连续高电平会每拍计数。
+
+### 中断组
+
+三个字段的 Info 填写相同的 `int:<组名>`，每组必须恰有一个 EVENT、一个 W1P（或 pulse）和一个 RW，且字段位宽一致。位段在各寄存器中的位置可以不同，按字段内 bit 0 对应 bit 0。缺少类型、重复类型、非法类型或位宽不一致均报错。数组组的三个字段须具有相同元素数，每个元素独立处理；`-p` 展开后仍按相同下标关联。
+
+- EVENT 保存中断状态，保留 `<field>_hw_set` 输入与 `<field>` 输出。
+- RW 保存 mask，**1 表示屏蔽，0 表示使能**，不输出字段值端口。
+- W1P 用于软件测试，写 1 产生内部置位脉冲，不输出字段值端口，读取返回零。
+- 每组生成 `<event字段名>_irq`，组合逻辑为 `|(event & ~mask)`；数组逐元素输出。不另外生成所有组的汇总端口。
+
+屏蔽不影响状态记录；解除屏蔽后，已记录的状态立即参与中断输出。测试寄存器的 W1P 脉冲在写入沿产生，EVENT 在下一时钟沿锁存；硬件置位和测试脉冲均优先于同一位的软件清零。复位值由表格填写，mask 默认 0 意味着不屏蔽。
+
+`int:` 和 `comb:` 的未加引号组名都读到第一个分号、逗号或空白为止，例如 `int:group0; PARITY_GEN`。中断组名区分大小写，含分隔符时须用引号包住整个标记，例如 `"int:组 A; 通道 0"; PARITY_GEN`。旧表中含分隔符的未加引号组名需补上引号。
+
+### RCI
+
+字段通过 `input [W-1:0] <field>` 输入。读地址命中时，模块在时钟沿捕获当前值，并将 `<field>_hw_clc` 置高一拍，外部负责清除字段。无命中读请求时，清零指示自动恢复为零；连续命中可连续置高。
+
+支持标量和数组，数组仅对命中元素输出清零指示。APB 模式在 setup 结束的时钟沿采样读请求。
+
+## 大位宽分段访问
+
+字段位宽超过 32 bit 时，自动拆为 `ceil(W/32)` 个总线地址，无需额外 Info 标记。仅支持 RW、RO、RAM_RW、RAM_RO；每个大位宽寄存器只允许一个字段，Bits 必须为 `W-1:0`。最终字段与 RAM 数据端口保持实际位宽，不补成 32 的整数倍。
+
+也可在各分段的 Info 中填写同一个 `comb:<组名>`。生成器按地址合并分段，然后按单个宽字段生成 RTL。合并基址和寄存器名取最低地址行，生成字段名取组名。
+
+例如 `Bits=94:0`、基址 `0x600`：
+
+| 地址 | 对应字段位段 | 有效总线位 |
+| --- | --- | --- |
+| `0x600` | `[31:0]` | `[31:0]` |
+| `0x604` | `[63:32]` | `[31:0]` |
+| `0x608` | `[94:64]` | `[30:0]`，读取 bit 31 为零 |
+
+软件须按低到高顺序完成一次访问。普通数组每个元素的影子寄存器独立，支持 `-p` 和 `--pack_array`。数组步进至少为 `ceil(W/32)*4` 字节且 4 字节对齐；RAM 步进还须为 2 的幂，例如 95 bit RAM 使用 `0x10`。步进内未使用的填充地址不选中该字段，读取返回零；若另行定义其他寄存器，则按该寄存器处理。
+
+| 类型 | 写入 | 读取 |
+| --- | --- | --- |
+| RW | 低段暂存于 `<field>_0`、`<field>_1` 等影子寄存器；最高地址写入沿一次提交完整字段。 | 分段读取最终已提交值，不建立读快照。 |
+| RO | 不接受软件写入。 | 最低地址读取沿返回当前低段，同时锁存完整输入；后续地址读 `<field>_rd_shadow` 的对应切片。 |
+| RAM_RW | 最低地址开始一轮写入并清除上轮暂存掩码；中间地址累积数据及掩码；最高地址才发起一次整条 RAM 写入。 | 最低地址发起整条 RAM 读取；数据有效时保存快照，后续地址直接读快照。 |
+| RAM_RO | 不接受软件写入。 | 同 RAM_RW。 |
+
+RW 的影子寄存器复位为默认值的对应切片；最终字段复位为完整默认值。每个分段按字节写掩码合并。最高地址的获准写入始终作为提交，即使本次最高段掩码为零，之前暂存的低段也会生效。RW 启用 PARITY_GEN 时，仅在完整提交时更新最终字段的偶校验位；影子寄存器自身不附加校验。软件不得在一轮 RW 分段读取中穿插新的写提交，否则可能读到两次提交的拼接结果。
+
+RAM_RW 的 `<field>_wdata/_wmask` 与完整字段等宽，外部 RAM 需按逐位掩码保留未写位；模块不读取 RAM 来合并部分写。每张 RAM 表各有一套读快照和写暂存，软件须完成当前 entry 的低到高访问，再访问同一表的其他 entry。写入须从最低地址开始，entry 不匹配的中间写或提交被忽略；读高段在尚无快照或 entry 不匹配时返回零。重新读最低地址刷新快照，写提交不主动刷新已有读快照。外部 RAM 内容不由模块复位。
+
+普通 RO 的首次读取直接返回本次输入低段，避免返回旧快照。默认同步 RAM 的首段直接返回有效 RAM 数据，下一时钟沿保存完整快照，支持紧接着读取高段。启用 `--table_pending` 时，首段读取在 access 完成沿锁存；低段暂存写及后续快照读不等待 RAM，只有首段 RAM 读和最高地址 RAM 写提交等待 ready，等待期间请求数据、掩码和 entry 保持稳定。所有软件暂存写和提交均受 LOCK_GEN 控制。
+
+## 配置接口
+
+| 总线 | 端口 |
+| --- | --- |
+| APB | `pclk, presetn, psel, penable, pwrite, paddr, pwdata, prdata, pready, pslverr` |
+| regbus | `clk, rst_n, reg_addr, wr_en, rd_en, wr_msk, wr_data, rd_data` |
+
+复位为低有效异步复位。regbus 的 `wr_msk[3:0]` 分别控制四个字节，读数据在读请求的时钟沿更新。
+
+APB 普通寄存器在 setup 结束沿采样读请求，在 access 结束沿执行写入；写掩码固定全有效，`pslverr` 固定为零。除启用 RAM 等待握手的表访问外，`pready` 为 1。
+
+## RAM 表接口
+
+每张表只允许一个字段，`Offset Addr` 指定表基址，`Entry` 指定深度和字节步进。步进必须为正的 2 的幂，并满足地址对齐要求。
+
+以下 `<table>` 为生成的字段名，地址端口输出元素索引，`wmask` 为逐位写掩码。
+
+| 类型 | 输出端口 | 输入端口 |
+| --- | --- | --- |
+| `RAM_RO` | `<table>_en, <table>_addr` | `<table>_rdata` |
+| `RAM_RW` | `<table>_en, <table>_we, <table>_addr, <table>_wdata, <table>_wmask` | `<table>_rdata` |
+
+默认按一拍同步读接口工作：请求沿采样地址，外部 RAM 在下一周期提供读数据；不支持额外等待。
+
+### 等待握手：`--table_pending`
+
+```sh
+python autoreg.py test_new.xlsx -o sys_reg.v --bus_type apb --table_pending
+```
+
+每张表增加 `<table>_ready` 输入，选中表的 `ready` 决定 APB `pready`：
+
+- **读**：`en` 从 setup 保持到 access 完成。`ready=1` 时，外部须同时提供有效 `rdata`。
+- **写**：`RAM_RW` 的 `en/we` 在 access 阶段保持有效；外部在 `en && ready` 的时钟沿完成一次写入，等待期间不得重复写入。
+- **完成**：`ready=0` 时等待；`ready=1` 时在 access 结束沿完成。普通寄存器、未命中地址及 `RAM_RO` 写入均不等待。
+
+读使能持续有效，直接连接同步 RAM 时会重复读取同一地址，无等待时读取两次。有读副作用的外部模块需避免重复执行。读数据在首个 access 周期有效且写入无需等待时，可将 `ready` 固定为 1。
+
+## 回归验证
+
+在本目录运行 `python -B -m unittest discover -s tests -v`。测试覆盖 A/B 表解析、别名、中断组校验、软硬件优先级、写掩码、计数边界、读回和中断屏蔽；另验证大位宽写提交、非零复位值、部分写、读快照、RAM 掩码与等待握手；RTL 仿真覆盖 APB/regbus 及标量、普通数组、packed 数组和 `-p`。仿真和编译测试需要 PATH 中有 `iverilog`、`vvp`，缺少工具时会标记为跳过。

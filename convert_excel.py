@@ -10,7 +10,7 @@ import os
 import re
 
 import openpyxl
-from register_features import (SUPPORTED_ACCESS, info_feature_text, normalize_access, parse_info_features,
+from register_features import (SUPPORTED_ACCESS, info_feature_text, normalize_access, parse_comb_group, parse_info_features,
                                parse_interrupt_group, validate_feature_specs,
                                validate_interrupt_specs, validate_version_specs)
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -80,12 +80,12 @@ def parse_default_value(default_value, bit_width):
 
 
 def convert_attribute_to_sw_access(attribute):
-    """Map a supported A-table attribute to a B-table software-access value."""
+    """Normalize A-table access, retaining W1S so the field can be filtered."""
     if attribute is None or str(attribute).strip() == '':
         return 'RW'
 
     access = normalize_access(attribute)
-    return access if access in SUPPORTED_ACCESS else None
+    return access if access in SUPPORTED_ACCESS or access == 'W1S' else None
 
 
 def warn_skipped_register(reg_name, field_name, attribute, row_number):
@@ -288,8 +288,12 @@ def parse_new_format(filename, bus_type='apb'):
 
             attribute = cell_value(row, columns, 'attribute')
             sw_access = convert_attribute_to_sw_access(attribute)
+            if sw_access == 'W1S':
+                current_reg['filtered_fields'] = True
+                continue
+            comb_group = parse_comb_group(info)
             if sw_access is None:
-                if parse_info_features(info) or parse_interrupt_group(info) is not None:
+                if comb_group is not None or parse_info_features(info) or parse_interrupt_group(info) is not None:
                     raise ValueError(f'Unsupported Attribute {attribute!r} on feature-marked field {field_name!r}')
                 if not current_reg['skip']:
                     warn_skipped_register(

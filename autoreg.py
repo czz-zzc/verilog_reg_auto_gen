@@ -10,7 +10,7 @@ import sys
 sys.dont_write_bytecode = True
 
 from convert_excel import parse_new_format, write_b_format
-from gen_reg import generate_verilog, parse_excel
+from gen_reg import NAME_TYPES, parse_excel, write_verilog_files
 from register_versions import prepare_version_update, save_version_update
 
 
@@ -63,6 +63,8 @@ def main():
                         help='Generated configuration interface (default: apb)')
     parser.add_argument('-p', '--parallel', action='store_true',
                         help='Enable parallel implementation for ordinary arrays')
+    parser.add_argument('--name_type', choices=NAME_TYPES, default='field',
+                        help='Field naming: field (default) or reg_field (register name + field name)')
     parser.add_argument('--keep_excel', action='store_true',
                         help='Keep the intermediate B-format Excel table')
     parser.add_argument('--pack_array', action='store_true',
@@ -88,20 +90,20 @@ def main():
             intermediate_file,
             parallel=args.parallel,
             module_name_override=os.path.splitext(os.path.basename(output_file))[0],
+            name_type=args.name_type,
         )
 
         verilog_file = resolve_verilog_path(args.output, b_module_info['module'])
         verilog_dir = os.path.dirname(verilog_file)
         if verilog_dir:
             os.makedirs(verilog_dir, exist_ok=True)
-        verilog_code = generate_verilog(b_module_info, b_registers, os.path.basename(verilog_file).split('.')[0], pack_array=args.pack_array, table_pending=args.table_pending)
-        with open(verilog_file, 'w', encoding='utf-8') as file:
-            file.write(verilog_code)
+        instance_file = write_verilog_files(b_module_info, b_registers, verilog_file,
+                                            pack_array=args.pack_array, table_pending=args.table_pending)
         check_verilog(verilog_file, b_module_info['module'], pack_array=args.pack_array)
         if version_update is not None:
             save_version_update(args.input, version_update)
-        print(f'Successfully generated {verilog_file}')
-        print('\033[31mReminder: promptly commit the generated RTL code and Excel register table to SVN or Git.\033[0m')
+        print(f'Successfully generated {verilog_file} and {instance_file}')
+        print('\033[31mReminder: promptly commit the generated RTL, instance header and Excel register table to SVN or Git.\033[0m')
     except (ValueError, OSError) as error:
         print(f'\033[31mError: {error}\033[0m', file=sys.stderr)
         if intermediate_file and os.path.exists(intermediate_file):

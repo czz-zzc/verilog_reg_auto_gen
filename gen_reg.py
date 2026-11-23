@@ -11,13 +11,17 @@ from datetime import datetime
 import argparse
 import os
 import sys
-from register_features import (SOFTWARE_WRITABLE, SUPPORTED_ACCESS, normalize_access,
-                               parse_info_features, parse_interrupt_group,
+from register_features import (SOFTWARE_WRITABLE, SUPPORTED_ACCESS, VERSION_FIELD_BITS, normalize_access,
+                               parse_comb_group, parse_info_features, parse_interrupt_group,
                                validate_feature_specs, validate_interrupt_specs, validate_version_specs)
 from wide_registers import (WIDE_ACCESS, is_wide_register, word_count,
                             emit_wide_declarations, emit_wide_decode, emit_wide_storage,
                             emit_wide_read_cases, emit_wide_array_read,
                             emit_wide_ram_declarations, emit_wide_ram)
+
+NAME_TYPES = {'field': 'field', 'reg_field': 'reg_field', 'filed': 'field', 'reg_filed': 'reg_field'}
+
+
 def parse_offset_address(expression):
     """Parse an offset cell; the new Excel format accepts a base address only."""
     value = str(expression).strip()
@@ -84,16 +88,18 @@ def format_array_port(direction, reg_keyword, width, name, depth, pack_array=Fal
         return f"{direction} {reg_keyword}  [{width - 1:02}:0]  {name}[{depth:02}:0],"
     return f"{direction}       [{width - 1:02}:0]  {name}[{depth:02}:0],"
 
+MODULE_PORT = re.compile(
+    r"^(?P<decl>(?:input|output)(?: reg)?)\s+"
+    r"(?:(?P<bit_range>(?:\[[^\]]+\])+)[ \t]+)?"
+    r"(?P<name>[^\s,\[\]]+)(?P<array>(?:\[[^\]]+\])*),$"
+)
+
+
 def align_module_port_names(port_lines):
     """Align signal names in a module port list, including packed dimensions."""
-    port_pattern = re.compile(
-        r"^(?P<decl>(?:input|output)(?: reg)?)\s+"
-        r"(?:(?P<bit_range>(?:\[[^\]]+\])+)[ \t]+)?"
-        r"(?P<name>[^ \t,]+),$"
-    )
     matched_ports = []
     for index, line in enumerate(port_lines):
-        match = port_pattern.match(line)
+        match = MODULE_PORT.match(line)
         if match:
             matched_ports.append((index, match))
 
@@ -105,8 +111,42 @@ def align_module_port_names(port_lines):
         declaration = match.group("decl")
         bit_range = match.group("bit_range") or ""
         port_lines[index] = (
-            f"{declaration:<12}{bit_range:<{max_range_width}}  {match.group('name')},"
+            f"{declaration:<12}{bit_range:<{max_range_width}}  {match['name']}{match['array']},"
         )
+
+
+def render_instance_header(module_name, bus_port_lines, field_port_lines):
+    """Declare field nets and connect every module port by name."""
+    bus_ports = [MODULE_PORT.fullmatch(line) for line in bus_port_lines]
+    field_ports = [MODULE_PORT.fullmatch(line) for line in field_port_lines]
+    ports = bus_ports + field_ports
+    if any(port is None for port in ports):
+        raise ValueError(f'Cannot format instance header for {module_name}: invalid port declaration')
+
+    code = [
+        '//============================================================================',
+        f'// {module_name} instance. Include inside the parent module.',
+        '// Bus signals are supplied by the parent module.',
+        '//============================================================================',
+    ]
+    if field_ports:
+        range_width = max(len(port['bit_range'] or '') for port in field_ports)
+        for port in field_ports:
+            bit_range = port['bit_range'] or ''
+            code.append(f"wire {bit_range:<{range_width}}  {port['name']}{port['array']};")
+        code.append('')
+    code.append(f'{module_name} u_{module_name} (')
+    names = [port['name'] for port in ports]
+    seen = set()
+    for name in names:
+        if name in seen:
+            raise ValueError(f'Duplicate generated port name: {name}')
+        seen.add(name)
+    name_width = max(map(len, names))
+    connections = [f'    .{name:<{name_width}} ({name})' for name in names]
+    code.append(',\n'.join(connections))
+    code.extend([');', ''])
+    return '\n'.join(code)
 
 
 def calculate_bit_width(bit_str):
@@ -251,6 +291,97 @@ def validate_ram_register(reg):
         raise ValueError(
             f"{ram_fields[0].sw_access} register {reg.reg_name!r} requires a positive power-of-two address step"
         )
+
+
+def default_binary_digits(field):
+    """Expand a validated slice default to bits, preserving X/Z across word boundaries."""
+    validate_default_value(field)
+    width = field.bits_size
+    literal = str(field.default).strip().lower()
+    if literal in ("'0", "'1"):
+        return literal[1] * width
+    if "'" not in literal:
+        return f'{int(literal, 0):0{width}b}'
+
+    _, value = literal.split("'", 1)
+    radix, digits = value[0], value[1:].replace('_', '').replace('?', 'z')
+    if 'x' not in digits and 'z' not in digits:
+        base = {'b': 2, 'o': 8, 'd': 10, 'h': 16}[radix]
+        return f'{int(digits, base):0{width}b}'
+    if radix == 'd':
+        if digits in {'x', 'z'}:
+            return digits * width
+        raise ValueError(f'Invalid decimal default {field.default!r} on comb field {field.name!r}')
+
+    digit_width = {'b': 1, 'o': 3, 'h': 4}[radix]
+    bits = ''.join(digit * digit_width if digit in 'xz' else f'{int(digit, 16):0{digit_width}b}'
+                   for digit in digits)
+    pad = digits[0] if digits[0] in 'xz' else '0'
+    return bits.rjust(width, pad)[-width:]
+
+
+def combine_wide_registers(registers):
+    """Normalize address-contiguous comb groups before the usual wide-field checks."""
+    groups = {}
+    for reg in registers:
+        for field in reg.fields:
+            group = parse_comb_group(field.info)
+            if group is None:
+                continue
+            if len(reg.fields) != 1:
+                raise ValueError(f'comb:{group} requires one field per register, including {reg.reg_name!r}')
+            if field.int_group is not None or 'LOCK_GEN' in field.features or field.name in VERSION_FIELD_BITS:
+                raise ValueError(f'comb:{group} cannot include interrupt, lock or version fields ({field.name!r})')
+            groups.setdefault(group, []).append(reg)
+
+    merged_slices = set()
+    for group, members in groups.items():
+        members.sort(key=lambda reg: int(reg.offset, 16))
+        first = members[0]
+        field = first.fields[0]
+        if len(members) == 1:
+            if not is_wide_register(first):
+                raise ValueError(f'comb:{group} requires multiple word slices or an existing wide field')
+            continue
+
+        base = int(first.offset, 16)
+        access = field.sw_access
+        width = 0
+        defaults = []
+        features = set()
+        for word, member in enumerate(members):
+            part = member.fields[0]
+            if int(member.offset, 16) != base + word * 4:
+                raise ValueError(f'comb:{group} offsets must be consecutive 4-byte words')
+            if part.sw_access != access or access not in WIDE_ACCESS:
+                raise ValueError(f'comb:{group} slices must all use the same RW, RO, RAM_RW or RAM_RO access')
+            if member.var is not None and (member.var_val, member.var_step) != (first.var_val, first.var_step):
+                raise ValueError(f'comb:{group} Entry must match the lowest address slice or be blank')
+
+            size = part.bits_size
+            if size > 32 or (word < len(members) - 1 and size != 32):
+                raise ValueError(f'comb:{group} requires 32 bits per slice except for the last slice (1–32 bits)')
+            bounds = tuple(int(bit) for bit in str(part.bits).split(':'))
+            high, low = bounds[0], bounds[-1]
+            if (high, low) not in {(size - 1, 0), (word * 32 + size - 1, word * 32)}:
+                raise ValueError(f'comb:{group} slice {part.name!r} must use low-aligned word bits or the corresponding full-field bit range')
+            if access not in RAM_ACCESS_TYPES:
+                defaults.append(default_binary_digits(part))
+            width += size
+            features.update(part.features)
+
+        field.name = group
+        field.bits = f'{width - 1}:0'
+        field.bits_size = width
+        field.features = frozenset(features)
+        if defaults:
+            bits = ''.join(reversed(defaults))
+            field.default = f"{width}'h{int(bits, 2):x}" if 'x' not in bits and 'z' not in bits else f"{width}'b{bits}"
+        merged_slices.update(members[1:])
+
+    return [reg for reg in registers if reg not in merged_slices]
+
+
 def describe_address_owner(reg, index):
     """Return a readable name for one concrete register/table address."""
     kind = f"{reg.fields[0].sw_access} table" if is_ram_register(reg) else 'register'
@@ -313,7 +444,21 @@ def validate_register_addresses(registers, module_size, addr_width):
 
             for byte_address in range(address, last_byte_address + 1):
                 occupied_bytes[byte_address] = (owner, address)
-def parse_excel(filename, parallel=False, module_name_override=None):
+def validate_generated_field_names(registers):
+    """Reject collisions between logical fields, including expanded array elements."""
+    owners = {}
+    for reg in registers:
+        for field in reg.fields:
+            if field.name in owners:
+                raise ValueError(f'Duplicate generated field name {field.name!r} in registers '
+                                 f'{owners[field.name]!r} and {reg.reg_name!r}')
+            owners[field.name] = reg.reg_name
+
+
+def parse_excel(filename, parallel=False, module_name_override=None, name_type='field'):
+    if name_type not in NAME_TYPES:
+        raise ValueError(f'Invalid name_type {name_type!r}; expected field or reg_field')
+    use_reg_prefix = NAME_TYPES[name_type] == 'reg_field'
     wb = openpyxl.load_workbook(filename)
     if not wb.worksheets:
         raise ValueError('Register description file does not contain a worksheet')
@@ -397,9 +542,9 @@ def parse_excel(filename, parallel=False, module_name_override=None):
         validate_register_bit_ranges(reg)
         sw_writable = any(field.sw_access in SOFTWARE_WRITABLE for field in reg.fields)
         reg.wr = 'w' if sw_writable else 'r'
-        registers.append(reg)
 
     current_reg = None
+    omitted_w1s = False
     reg_name_set = set()
     field_name_set = set()
 
@@ -421,10 +566,11 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                 raise ValueError(f'Duplicate register name found: {reg_name}')
             reg_name_set.add(reg_name)
 
-            if current_reg:
-                finalize_register(current_reg)
+            if current_reg and (current_reg.fields or not omitted_w1s):
+                registers.append(current_reg)
 
             current_reg = Register()
+            omitted_w1s = False
             current_reg.offset = offset[2:]
             current_reg.reg_name = reg_name
             if has_repeat:
@@ -439,22 +585,26 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                 current_reg.var_step = None
                 current_reg.var_val = None
         bits_value = cell_value(row, 'bits')
+        sw_access = normalize_access(cell_value(row, 'sw_access'))
+        if sw_access == 'W1S' and current_reg is not None:
+            omitted_w1s = True
+            continue
         if bits_value is not None and str(bits_value).strip() != '':
             if current_reg is None:
                 raise ValueError(f'Field is defined before a register in row {row_number}')
             field_name = cell_value(row, 'field')
-            sw_access = cell_value(row, 'sw_access')
-            if field_name is None or str(field_name).strip() == '' or sw_access is None or str(sw_access).strip() == '':
+            if field_name is None or str(field_name).strip() == '' or not sw_access:
                 raise ValueError(f'One or more required field columns are missing in row {row_number}')
 
             field = Field()
             field.bits = bits_value
             field.bits_size = calculate_bit_width(bits_value)
             field.name = str(field_name).strip()
-            if field.name in field_name_set:
-                raise ValueError(f'Duplicate field name found: {field.name}')
-            field_name_set.add(field.name)
-            field.sw_access = normalize_access(sw_access)
+            field_key = (current_reg.reg_name, field.name) if use_reg_prefix else field.name
+            if field_key in field_name_set:
+                raise ValueError(f'Duplicate field name {field.name!r} in register {current_reg.reg_name!r}')
+            field_name_set.add(field_key)
+            field.sw_access = sw_access
             if field.sw_access not in SUPPORTED_ACCESS:
                 raise ValueError(f'Invalid sw_access value: {field.sw_access}')
             field.default = cell_value(row, 'default')
@@ -465,14 +615,31 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                 raise ValueError(f'Default value not found for field {field.name!r}')
             current_reg.fields.append(field)
 
-    if current_reg:
-        finalize_register(current_reg)
+    if current_reg and (current_reg.fields or not omitted_w1s):
+        registers.append(current_reg)
+
+    registers = combine_wide_registers(registers)
+    for reg in registers:
+        finalize_register(reg)
 
     validate_register_addresses(registers, module_size=module_size, addr_width=addr_width)
     validate_version_specs(
         (field.name, field.sw_access, field.bits, reg.var is not None)
         for reg in registers for field in reg.fields
     )
+    if use_reg_prefix:
+        for reg in registers:
+            for field in reg.fields:
+                # The version fields are reserved names used for Excel writeback and readback.
+                if field.name in VERSION_FIELD_BITS:
+                    continue
+                name = f'{reg.reg_name}_{field.name}'
+                if name in VERSION_FIELD_BITS:
+                    raise ValueError(f'Generated field name {name!r} conflicts with a reserved version field')
+                if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', name):
+                    raise ValueError(f'Invalid generated field name {name!r}; expected a Verilog identifier')
+                field.name = name
+    validate_generated_field_names(registers)
     validate_feature_specs(
         (field.name, field.sw_access, field.bits_size, reg.var is not None, field.features)
         for reg in registers for field in reg.fields
@@ -517,6 +684,7 @@ def parse_excel(filename, parallel=False, module_name_override=None):
                 expanded_registers.append(reg)
         expanded_registers.sort(key=lambda reg: int(reg.offset, 16))
         registers = expanded_registers
+        validate_generated_field_names(registers)
     return module_info, registers
 def collect_interrupt_groups(registers):
     return validate_interrupt_specs(
@@ -641,6 +809,13 @@ def emit_parity_storage(code, reg, field, write_allowed):
 
 
 def generate_verilog(module_info, registers, filename, pack_array=False, table_pending=False):
+    """Return module RTL for callers that do not write the instance header."""
+    verilog, _ = generate_verilog_with_instance(module_info, registers, filename, pack_array, table_pending)
+    return verilog
+
+
+def generate_verilog_with_instance(module_info, registers, filename, pack_array=False, table_pending=False):
+    """Render the module and its instance header from the same port list."""
     now = datetime.now()
     code = []
     
@@ -670,7 +845,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
         generated_names = {members['EVENT'][0] + '_irq' for members in interrupt_groups.values()}
         suffixes = {'EVENT': ('hw_set',), 'ONE_SHOT': ('hw_clr',),
                     'CNT': ('hw_inc',), 'RCNT': ('hw_inc',),
-                    'RWW': ('hw_en', 'hw_val'), 'W1C': ('hw_en', 'hw_val'),
+                    'RWW': ('hw_en', 'hw_val'),
                     'RC': ('hw_en', 'hw_val'), 'RCI': ('hw_clc',)}
         for reg in registers:
             for field in reg.fields:
@@ -715,6 +890,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
     code.append(header_separator + "\n")    
     # Module declaration
     code.append(f"module {module_info['module']} (")
+    bus_port_start = len(code)
     if is_apb:
         code.append( "input               pclk,")
         code.append( "input               presetn,")
@@ -735,6 +911,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
         code.append( "input       [3 :0]  wr_msk,")
         code.append( "input       [31:0]  wr_data,")
         code.append("output      [31:0]  rd_data," if has_ram else "output reg  [31:0]  rd_data,")
+    field_port_start = len(code)
     # Signals
     for reg in registers:
         if reg.var is not None:# Variable registers
@@ -760,7 +937,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
                     continue
                 if field.sw_access in ("RW", "WO", "W1P"):
                     code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
-                elif field.sw_access in ("W1C", "RC", "RWW"):
+                elif field.sw_access in ("RC", "RWW"):
                     code.append(format_array_port("input", "", 1, f"{field.name}_hw_en", reg.var_val, pack_array, packed_range_width))
                     code.append(format_array_port("input", "", field.bits_size, f"{field.name}_hw_val", reg.var_val, pack_array, packed_range_width))
                     code.append(format_array_port("output", "reg", field.bits_size, field.name, reg.var_val, pack_array, packed_range_width))
@@ -783,7 +960,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
                         code.append(f"output reg          {field.name},")
                     else:
                         code.append(f"output reg  [{field.bits_size-1:02d}:0]  {field.name},")
-                elif field.sw_access in ("W1C", "RC", "RWW"):
+                elif field.sw_access in ("RC", "RWW"):
                     if field.bits_size == 1:
                         code.append(f"input               {field.name}_hw_en,")
                         code.append(f"input               {field.name}_hw_val,")
@@ -819,6 +996,9 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
         else:
             code.append(f'output reg          parity_err_{field.name},')
 
+    instance_header = render_instance_header(module_info['module'],
+                                             code[bus_port_start:field_port_start],
+                                             code[field_port_start:])
     align_module_port_names(code)
     code[-1] = code[-1].rstrip(',')  # Remove last comma
     code.append(");\n")
@@ -1067,7 +1247,7 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
                         field_wr_en = f'({field_wr_en} & autoreg_write_allowed)'
                     if 'PARITY_GEN' in field.features:
                         continue
-                    if field.sw_access not in ("RW", "WO", "W1P", "W1C", "RC"):
+                    if field.sw_access not in ("RW", "WO", "W1P", "RC"):
                         continue
                     code.append( "//============================================================================")
                     code.append(f"// {field.name} addr:{_addr_width}'h{reg.offset} type:{field.sw_access} bits:[{field.bits}] default:{field.default}")
@@ -1089,11 +1269,6 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
                         code.append(f"                    {field.name}[i] <= wr_data[{field.bits}] & msk[{field.bits}];")
                         code.append("                else")
                         code.append(f"                    {field.name}[i] <= {field.bits_size}'h0;")
-                    elif field.sw_access == "W1C":
-                        code.append(f"                if ({field.name}_hw_en[i] == 1'b1)")
-                        code.append(f"                    {field.name}[i] <= {field.name}_hw_val[i];")
-                        code.append(f"                else if ({field_wr_en} == 1'b1)")
-                        code.append(f"                    {field.name}[i] <= (~wr_data[{field.bits}] | ~msk[{field.bits}]) & {field.name}[i];")
                     elif field.sw_access == "RC":
                         code.append(f"                if ({field.name}_hw_en[i] == 1'b1)")
                         code.append(f"                    {field.name}[i] <= {field.name}_hw_val[i];")
@@ -1153,12 +1328,6 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
                         code.append(f"            {field.name} <= wr_data[{field.bits}] & msk[{field.bits}];")
                         code.append("        else")
                         code.append(f"            {field.name} <= {field.bits_size}'h0;")
-                    elif field.sw_access == "W1C":
-                        code.append(f"        if ({field.name}_hw_en == 1'b1)")
-                        code.append(f"            {field.name} <= {field.name}_hw_val;")
-                        code.append(f"        else if ({field_wr_en} == 1'b1)")
-                        code.append(f"            {field.name} <= (~wr_data[{field.bits}] | ~msk[{field.bits}]) & {field.name};")
-                    
                     elif field.sw_access == "RC":
                         code.append(f"        if ({field.name}_hw_en == 1'b1)")
                         code.append(f"            {field.name} <= {field.name}_hw_val;")
@@ -1297,7 +1466,21 @@ def generate_verilog(module_info, registers, filename, pack_array=False, table_p
 
     code.append("endmodule")
     
-    return "\n".join(code)
+    return "\n".join(code), instance_header
+
+
+def write_verilog_files(module_info, registers, output_file, pack_array=False, table_pending=False):
+    """Write matching RTL and instance header beside one another."""
+    output_base = os.path.splitext(output_file)[0]
+    verilog, instance_header = generate_verilog_with_instance(
+        module_info, registers, os.path.basename(output_base), pack_array, table_pending,
+    )
+    instance_file = f'{output_base}_inst.vh'
+    with open(output_file, 'w', encoding='utf-8') as file:
+        file.write(verilog)
+    with open(instance_file, 'w', encoding='utf-8') as file:
+        file.write(instance_header)
+    return instance_file
 
 # if __name__ == "__main__":
 #     module_info, registers = parse_excel("sys_reg.xlsx",parallel=False)
@@ -1310,12 +1493,14 @@ if __name__ == "__main__":
     parser.add_argument('input', help='Input Excel file')
     parser.add_argument('-o', '--output', help='Output path or file. Can be a directory path (generates module_name.v) or complete file path')
     parser.add_argument('-p', '--parallel', action='store_true', help='Enable parrllel implement for loop. Default by array implement')
+    parser.add_argument('--name_type', choices=NAME_TYPES, default='field',
+                        help='Field naming: field (default) or reg_field (register name + field name)')
     parser.add_argument('--pack_array', action='store_true', help='Generate variable-register ports as packed arrays')
     parser.add_argument('--table_pending', action='store_true', help='Use RAM table ready handshakes (APB only)')
     args = parser.parse_args()
 
     try:
-        module_info, registers = parse_excel(args.input, parallel=args.parallel)
+        module_info, registers = parse_excel(args.input, parallel=args.parallel, name_type=args.name_type)
         if args.table_pending and module_info['cfg_interface'] != 'apb':
             raise ValueError('--table_pending requires an APB configuration interface')
     except (ValueError, OSError) as error:
@@ -1343,8 +1528,11 @@ if __name__ == "__main__":
         # Default: generate in current directory
         output_file = f"{module_info['module']}.v"
     
-    verilog_code = generate_verilog(module_info, registers, os.path.basename(output_file).split('.')[0], pack_array=args.pack_array, table_pending=args.table_pending)
-    with open(output_file, 'w') as f:
-        f.write(verilog_code)
-    print(f"Successfully generated {output_file}")
+    try:
+        instance_file = write_verilog_files(module_info, registers, output_file,
+                                            pack_array=args.pack_array, table_pending=args.table_pending)
+    except (ValueError, OSError) as error:
+        print(f'\033[31mError: {error}\033[0m', file=sys.stderr)
+        sys.exit(1)
+    print(f"Successfully generated {output_file} and {instance_file}")
 
