@@ -19,6 +19,20 @@ def normalize_access(value):
     return access
 
 
+def validate_version_specs(specs):
+    """Validate reserved version fields: (name, access, bits, is_array)."""
+    expected_bits = {'rtl_version': '31:8', 'reg_version': '7:0'}
+    seen = set()
+    for name, access, bits, is_array in specs:
+        if name not in expected_bits:
+            continue
+        if name in seen:
+            raise ValueError(f'Duplicate version field {name!r}')
+        seen.add(name)
+        if access != 'RO' or re.sub(r'\s+', '', str(bits)) != expected_bits[name] or is_array:
+            raise ValueError(f"Version field {name!r} must be a scalar RO field with bits [{expected_bits[name]}]")
+
+
 def parse_interrupt_group(value):
     """The int: marker consumes the rest of Info, preserving arbitrary group names."""
     text = str(value or '')
